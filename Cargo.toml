@@ -9,7 +9,7 @@ description = "A minimalist, anti-bloat desktop Spotify client"
 tokio = { version = "1", features = ["full"] }
 
 # Spotify Web API + OAuth2
-rspotify = { version = "0.13", features = ["client-reqwest"] }
+rspotify = { version = "0.16.1", features = ["client-reqwest"] }
 
 # OS-native secret storage
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
@@ -40,3 +40,12 @@ env_logger = "0.11"
 # User directories (for cache path)
 dirs = "6"
 
+# HTTP client for Last.fm API
+reqwest = { version = "0.12", features = ["json"] }
+
+# Async stream utilities (for rspotify pagination)
+futures-util = "0.3"
+
+# Local Telemetry Database
+rusqlite = { version = "0.31", features = ["bundled"] }
+chrono = "0.4"
