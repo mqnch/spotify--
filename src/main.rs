@@ -8,9 +8,9 @@ use rspotify::prelude::*;
 async fn main() -> Result<()> {
     println!();
     println!("  ╔═══════════════════════════╗");
-    println!("  ║       ♫  O N Y X  ♫       ║");
+    println!("  ║         spotify--         ║");
     println!("  ╠═══════════════════════════╣");
-    println!("  ║  Minimalist Spotify Client ║");
+    println!("  ║   Minimal Spotify Client  ║");
     println!("  ╚═══════════════════════════╝");
 
     // ── Step 1: Ensure API keys are configured ───────────────────────
