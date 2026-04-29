@@ -1,0 +1,18 @@
+# Docs (private)
+docs
+
+# Rust build artifacts
+/target
+
+# Spotify token cache
+.spotify_token_cache.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
