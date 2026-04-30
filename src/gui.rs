@@ -408,6 +408,8 @@ impl OnyxApp {
             .as_ref()
             .is_some_and(|selected| selected.id == playlist.id)
         {
+            self.main_view = MainView::Playlist;
+            ctx.request_repaint();
             return;
         }
 
@@ -1335,11 +1337,7 @@ impl eframe::App for OnyxApp {
         // CENTRAL PANEL (#121212)
         let mut central_frame = egui::Frame::default();
         central_frame.fill = egui::Color32::from_rgb(18, 18, 18);
-        central_frame.inner_margin = if self.main_view == MainView::Dashboard {
-            egui::Margin::same(0)
-        } else {
-            egui::Margin::same(24)
-        };
+        central_frame.inner_margin = egui::Margin::same(24);
 
         egui::CentralPanel::default()
             .frame(central_frame)
@@ -1654,11 +1652,11 @@ impl OnyxApp {
 
     fn render_dashboard_view(&mut self, ui: &mut egui::Ui) {
         const DASHBOARD_PAD_LEFT: f32 = 28.0;
-        const DASHBOARD_PAD_RIGHT: f32 = 44.0;
+        const DASHBOARD_PAD_RIGHT: f32 = 28.0;
         const DASHBOARD_PAD_TOP: f32 = 18.0;
         const DASHBOARD_PAD_BOTTOM: f32 = 28.0;
 
-        self.render_dashboard_edge_header(ui);
+        self.render_central_header(ui);
 
         egui::ScrollArea::vertical()
             .id_salt("dashboard_scroll")
@@ -1683,19 +1681,6 @@ impl OnyxApp {
             });
     }
 
-    fn render_dashboard_edge_header(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(14.0);
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(24.0);
-                if icon_button(ui, IconKind::Settings, 28.0).clicked() {
-                    self.main_view = MainView::Settings;
-                }
-            });
-        });
-        ui.add_space(4.0);
-    }
-
     fn render_dashboard_content(&mut self, ui: &mut egui::Ui) {
         self.render_dashboard_header(ui);
         ui.add_space(16.0);
@@ -1710,13 +1695,15 @@ impl OnyxApp {
         }
 
         if self.listening_stats.total_plays == 0 {
-            let card_width = ui.available_width().min(760.0);
+            const EMPTY_CARD_PAD: i8 = 18;
+            let outer = ui.available_width().min(760.0);
+            let inner_w = (outer - 2.0 * f32::from(EMPTY_CARD_PAD)).max(1.0);
             egui::Frame::default()
                 .fill(egui::Color32::from_rgb(31, 31, 31))
                 .corner_radius(8.0)
-                .inner_margin(egui::Margin::same(18))
+                .inner_margin(egui::Margin::same(EMPTY_CARD_PAD))
                 .show(ui, |ui| {
-                    ui.set_width(card_width);
+                    ui.set_width(inner_w);
                     ui.heading(
                         egui::RichText::new("No listening history yet")
                             .color(egui::Color32::WHITE)
@@ -1745,16 +1732,26 @@ impl OnyxApp {
         }
 
         self.render_summary_cards(ui);
-        ui.add_space(24.0);
+        const STATS_SECTION_GAP: f32 = 12.0;
+        ui.add_space(STATS_SECTION_GAP);
 
         if ui.available_width() < 760.0 {
             self.render_ranked_card(ui, "Top Tracks", RankingKind::Tracks);
-            ui.add_space(16.0);
+            ui.add_space(STATS_SECTION_GAP);
             self.render_ranked_card(ui, "Top Artists", RankingKind::Artists);
         } else {
-            ui.columns(2, |columns| {
-                self.render_ranked_card(&mut columns[0], "Top Tracks", RankingKind::Tracks);
-                self.render_ranked_card(&mut columns[1], "Top Artists", RankingKind::Artists);
+            let available = ui.available_width();
+            let col_width = (available - STATS_SECTION_GAP) / 2.0;
+            ui.horizontal(|ui| {
+                ui.allocate_ui(egui::vec2(col_width, 0.0), |ui| {
+                    ui.set_width(col_width);
+                    self.render_ranked_card(ui, "Top Tracks", RankingKind::Tracks);
+                });
+                ui.add_space(STATS_SECTION_GAP);
+                ui.allocate_ui(egui::vec2(col_width, 0.0), |ui| {
+                    ui.set_width(col_width);
+                    self.render_ranked_card(ui, "Top Artists", RankingKind::Artists);
+                });
             });
         }
 
@@ -3264,15 +3261,18 @@ fn display_position_ms(state: &PlaybackState) -> u32 {
         .min(state.duration_ms.max(state.position_anchor_ms))
 }
 
-fn summary_card(ui: &mut egui::Ui, label: &str, value: &str, width: f32) {
+fn summary_card(ui: &mut egui::Ui, label: &str, value: &str, outer_width: f32) {
     let card_height = 110.0;
+    const INNER_PAD: i8 = 18;
+    let pad = f32::from(INNER_PAD);
+    let inner_w = (outer_width - 2.0 * pad).max(1.0);
     egui::Frame::default()
         .fill(egui::Color32::from_rgb(31, 31, 31))
         .corner_radius(10.0)
-        .inner_margin(egui::Margin::same(18))
+        .inner_margin(egui::Margin::same(INNER_PAD))
         .show(ui, |ui| {
-            ui.set_min_size(egui::vec2(width, card_height));
-            ui.set_width(width);
+            ui.set_min_size(egui::vec2(inner_w, card_height));
+            ui.set_width(inner_w);
             ui.label(
                 egui::RichText::new(label)
                     .color(egui::Color32::from_rgb(179, 179, 179))
@@ -3317,8 +3317,9 @@ fn render_bar_rankings(
         .corner_radius(8.0)
         .inner_margin(egui::Margin::same(16))
         .show(ui, |ui| {
-            ui.set_width((ui.available_width() - 2.0).max(260.0));
-            ui.set_min_width(260.0);
+            let w = ui.available_width().max(0.0);
+            ui.set_width(w);
+            ui.set_min_width(0.0);
             ui.horizontal(|ui| {
                 ui.heading(
                     egui::RichText::new(title)
