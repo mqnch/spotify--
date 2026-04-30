@@ -3,12 +3,13 @@ use crate::config::AppConfig;
 use crate::downloads::{DOWNLOAD_DOWNLOADED, DOWNLOAD_DOWNLOADING, DownloadStatuses};
 use crate::player::AudioCmd;
 use crate::spotify_api::{PlaylistSummary, PlaylistTrack};
-use crate::telemetry::TelemetryDb;
+use crate::telemetry::{ListeningStats, RankedItem, StatsDateRange, StatsMetric, TelemetryDb};
+use chrono::{Datelike, Utc};
 use eframe::egui;
 use rspotify::AuthCodeSpotify;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
@@ -76,6 +77,19 @@ enum MainView {
 enum IconKind {
     Home,
     Settings,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatsRangeMode {
+    AllTime,
+    Year,
+    Month,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RankingKind {
+    Tracks,
+    Artists,
 }
 
 #[derive(Clone, Copy)]
@@ -170,8 +184,15 @@ pub struct OnyxApp {
     pub playback_state: Arc<Mutex<PlaybackState>>,
     pub db: Arc<Mutex<TelemetryDb>>,
 
-    top_artists: Vec<crate::telemetry::TopItem>,
-    top_tracks: Vec<crate::telemetry::TopItem>,
+    listening_stats: ListeningStats,
+    stats_status: Option<String>,
+    stats_range_mode: StatsRangeMode,
+    selected_stats_year: i32,
+    selected_stats_month: u32,
+    track_stats_metric: StatsMetric,
+    artist_stats_metric: StatsMetric,
+    track_stats_limit: u32,
+    artist_stats_limit: u32,
     main_view: MainView,
     app_config: AppConfig,
     config_draft: AppConfig,
@@ -196,6 +217,7 @@ pub struct OnyxApp {
     pending_queue_index: Option<usize>,
     last_queue_load_at: Option<Instant>,
     observed_end_count: u64,
+    stats_refresh_due_at: Option<Instant>,
     last_sent_volume: u16,
     previous_volume: u16,
 
@@ -223,14 +245,27 @@ impl OnyxApp {
         cc.egui_ctx.set_visuals(visuals);
         install_manrope_font(&cc.egui_ctx);
 
-        let (top_artists, top_tracks) = {
+        let current_year = Utc::now().year();
+        let current_month = Utc::now().month();
+        let (listening_stats, stats_status) = {
             if let Ok(db_lock) = db.lock() {
-                (
-                    db_lock.top_artists(10).unwrap_or_default(),
-                    db_lock.top_tracks(10).unwrap_or_default(),
-                )
+                match db_lock.listening_stats_for_range(
+                    StatsDateRange::AllTime,
+                    10,
+                    StatsMetric::Plays,
+                    StatsMetric::Plays,
+                ) {
+                    Ok(stats) => (stats, None),
+                    Err(e) => (
+                        ListeningStats::default(),
+                        Some(format!("Failed to load listening stats: {}", e)),
+                    ),
+                }
             } else {
-                (Vec::new(), Vec::new())
+                (
+                    ListeningStats::default(),
+                    Some("Failed to access listening stats database.".to_string()),
+                )
             }
         };
 
@@ -328,8 +363,15 @@ impl OnyxApp {
             audio_cmd_tx,
             playback_state,
             db,
-            top_artists,
-            top_tracks,
+            listening_stats,
+            stats_status,
+            stats_range_mode: StatsRangeMode::AllTime,
+            selected_stats_year: current_year,
+            selected_stats_month: current_month,
+            track_stats_metric: StatsMetric::Plays,
+            artist_stats_metric: StatsMetric::Plays,
+            track_stats_limit: 10,
+            artist_stats_limit: 10,
             main_view: MainView::Dashboard,
             app_config: app_config.clone(),
             config_draft: app_config,
@@ -352,6 +394,7 @@ impl OnyxApp {
             pending_queue_index: None,
             last_queue_load_at: None,
             observed_end_count: 0,
+            stats_refresh_due_at: None,
             last_sent_volume: u16::MAX,
             previous_volume: u16::MAX,
             shuffle: false,
@@ -550,6 +593,72 @@ impl OnyxApp {
             ctx.request_repaint();
         });
     }
+
+    fn refresh_listening_stats(&mut self) {
+        let range = self.current_stats_range();
+        let limit = self.track_stats_limit.max(self.artist_stats_limit).max(10);
+        let stats_result = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to access listening stats database."))
+            .and_then(|db_lock| {
+                db_lock.listening_stats_for_range(
+                    range,
+                    limit,
+                    self.track_stats_metric,
+                    self.artist_stats_metric,
+                )
+            });
+
+        match stats_result {
+            Ok(stats) => {
+                self.listening_stats = stats;
+                self.sync_selected_stats_date();
+                self.stats_status = None;
+            }
+            Err(e) => {
+                self.stats_status = Some(format!("Failed to refresh listening stats: {}", e));
+            }
+        }
+    }
+
+    fn current_stats_range(&self) -> StatsDateRange {
+        match self.stats_range_mode {
+            StatsRangeMode::AllTime => StatsDateRange::AllTime,
+            StatsRangeMode::Year => StatsDateRange::Year(self.selected_stats_year),
+            StatsRangeMode::Month => StatsDateRange::Month {
+                year: self.selected_stats_year,
+                month: self.selected_stats_month,
+            },
+        }
+    }
+
+    fn sync_selected_stats_date(&mut self) {
+        if self
+            .listening_stats
+            .available_years
+            .contains(&self.selected_stats_year)
+        {
+            if self.stats_range_mode == StatsRangeMode::Month
+                && !self
+                    .listening_stats
+                    .available_months
+                    .contains(&self.selected_stats_month)
+            {
+                if let Some(month) = self.listening_stats.available_months.first().copied() {
+                    self.selected_stats_month = month;
+                }
+            }
+            return;
+        }
+
+        if let Some(year) = self.listening_stats.available_years.first().copied() {
+            self.selected_stats_year = year;
+            if let Some(month) = self.listening_stats.available_months.first().copied() {
+                self.selected_stats_month = month;
+            }
+        }
+    }
 }
 
 impl eframe::App for OnyxApp {
@@ -562,6 +671,15 @@ impl eframe::App for OnyxApp {
 
         if state.is_playing {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        if self
+            .stats_refresh_due_at
+            .is_some_and(|refresh_at| Instant::now() >= refresh_at)
+        {
+            self.stats_refresh_due_at = None;
+            self.refresh_listening_stats();
+        } else if self.stats_refresh_due_at.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
 
         // BOTTOM BAR (#181818)
@@ -1217,7 +1335,11 @@ impl eframe::App for OnyxApp {
         // CENTRAL PANEL (#121212)
         let mut central_frame = egui::Frame::default();
         central_frame.fill = egui::Color32::from_rgb(18, 18, 18);
-        central_frame.inner_margin = egui::Margin::same(24);
+        central_frame.inner_margin = if self.main_view == MainView::Dashboard {
+            egui::Margin::same(0)
+        } else {
+            egui::Margin::same(24)
+        };
 
         egui::CentralPanel::default()
             .frame(central_frame)
@@ -1235,19 +1357,14 @@ impl eframe::App for OnyxApp {
                     }
                 }
 
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_button(ui, IconKind::Settings, 28.0).clicked() {
-                            self.main_view = MainView::Settings;
-                        }
-                    });
-                });
-                ui.add_space(8.0);
-
                 match self.main_view {
-                    MainView::Settings => self.render_settings_view(ui),
+                    MainView::Settings => {
+                        self.render_central_header(ui);
+                        self.render_settings_view(ui);
+                    }
                     MainView::Playlist => {
                         if let Some(playlist) = self.selected_playlist.clone() {
+                            self.render_central_header(ui);
                             let playlist_state = self.playlist_state.lock().unwrap().clone();
                             self.maybe_run_pending_autoplay(&playlist_state);
                             self.render_playlist_view(ui, &playlist, &playlist_state, &state);
@@ -1262,6 +1379,17 @@ impl eframe::App for OnyxApp {
 }
 
 impl OnyxApp {
+    fn render_central_header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, IconKind::Settings, 28.0).clicked() {
+                    self.main_view = MainView::Settings;
+                }
+            });
+        });
+        ui.add_space(8.0);
+    }
+
     fn render_playlist_view(
         &mut self,
         ui: &mut egui::Ui,
@@ -1524,35 +1652,371 @@ impl OnyxApp {
         );
     }
 
-    fn render_dashboard_view(&self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.heading(
-                egui::RichText::new("Dashboard")
-                    .color(egui::Color32::WHITE)
-                    .size(24.0)
-                    .strong(),
-            );
-            ui.add_space(16.0);
+    fn render_dashboard_view(&mut self, ui: &mut egui::Ui) {
+        const DASHBOARD_PAD_LEFT: f32 = 28.0;
+        const DASHBOARD_PAD_RIGHT: f32 = 44.0;
+        const DASHBOARD_PAD_TOP: f32 = 18.0;
+        const DASHBOARD_PAD_BOTTOM: f32 = 28.0;
 
-            ui.columns(2, |columns| {
-                columns[0].heading(egui::RichText::new("Top Tracks").color(egui::Color32::WHITE));
-                columns[0].add_space(8.0);
-                for track in &self.top_tracks {
-                    columns[0].label(
-                        egui::RichText::new(format!("{} ({} plays)", track.name, track.count))
-                            .color(egui::Color32::from_rgb(179, 179, 179)),
-                    );
-                }
+        self.render_dashboard_edge_header(ui);
 
-                columns[1].heading(egui::RichText::new("Top Artists").color(egui::Color32::WHITE));
-                columns[1].add_space(8.0);
-                for artist in &self.top_artists {
-                    columns[1].label(
-                        egui::RichText::new(format!("{} ({} plays)", artist.name, artist.count))
-                            .color(egui::Color32::from_rgb(179, 179, 179)),
+        egui::ScrollArea::vertical()
+            .id_salt("dashboard_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let content_width =
+                    (ui.available_width() - DASHBOARD_PAD_LEFT - DASHBOARD_PAD_RIGHT).max(280.0);
+                ui.add_space(DASHBOARD_PAD_TOP);
+                ui.horizontal(|ui| {
+                    ui.add_space(DASHBOARD_PAD_LEFT);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(content_width, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_width(content_width);
+                            self.render_dashboard_content(ui);
+                        },
                     );
+                    ui.add_space(DASHBOARD_PAD_RIGHT);
+                });
+                ui.add_space(DASHBOARD_PAD_BOTTOM);
+            });
+    }
+
+    fn render_dashboard_edge_header(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(24.0);
+                if icon_button(ui, IconKind::Settings, 28.0).clicked() {
+                    self.main_view = MainView::Settings;
                 }
             });
+        });
+        ui.add_space(4.0);
+    }
+
+    fn render_dashboard_content(&mut self, ui: &mut egui::Ui) {
+        self.render_dashboard_header(ui);
+        ui.add_space(16.0);
+
+        if let Some(status) = &self.stats_status {
+            ui.label(
+                egui::RichText::new(status)
+                    .color(egui::Color32::from_rgb(255, 180, 120))
+                    .size(12.0),
+            );
+            ui.add_space(12.0);
+        }
+
+        if self.listening_stats.total_plays == 0 {
+            let card_width = ui.available_width().min(760.0);
+            egui::Frame::default()
+                .fill(egui::Color32::from_rgb(31, 31, 31))
+                .corner_radius(8.0)
+                .inner_margin(egui::Margin::same(18))
+                .show(ui, |ui| {
+                    ui.set_width(card_width);
+                    ui.heading(
+                        egui::RichText::new("No listening history yet")
+                            .color(egui::Color32::WHITE)
+                            .size(18.0),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Import your Spotify data export from Settings, or listen in Onyx to start building stats.",
+                        )
+                        .color(egui::Color32::from_rgb(179, 179, 179))
+                        .size(13.0),
+                    );
+                    ui.add_space(12.0);
+                    if ui
+                        .add(
+                            egui::Button::new("Open Settings")
+                                .fill(egui::Color32::from_rgb(30, 215, 96)),
+                        )
+                        .clicked()
+                    {
+                        self.main_view = MainView::Settings;
+                    }
+                });
+            return;
+        }
+
+        self.render_summary_cards(ui);
+        ui.add_space(24.0);
+
+        if ui.available_width() < 760.0 {
+            self.render_ranked_card(ui, "Top Tracks", RankingKind::Tracks);
+            ui.add_space(16.0);
+            self.render_ranked_card(ui, "Top Artists", RankingKind::Artists);
+        } else {
+            ui.columns(2, |columns| {
+                self.render_ranked_card(&mut columns[0], "Top Tracks", RankingKind::Tracks);
+                self.render_ranked_card(&mut columns[1], "Top Artists", RankingKind::Artists);
+            });
+        }
+
+        if !self.listening_stats.top_albums.is_empty() {
+            ui.add_space(24.0);
+            let width = if ui.available_width() < 760.0 {
+                ui.available_width()
+            } else {
+                (ui.available_width() - 12.0) / 2.0
+            };
+            ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
+                render_bar_rankings(
+                    ui,
+                    "Top Albums",
+                    &self.listening_stats.top_albums,
+                    StatsMetric::Plays,
+                    self.listening_stats.top_albums.len() as u32,
+                    false,
+                );
+            });
+        }
+    }
+
+    fn render_dashboard_header(&mut self, ui: &mut egui::Ui) {
+        ui.heading(
+            egui::RichText::new("Listening Stats")
+                .color(egui::Color32::WHITE)
+                .size(26.0)
+                .strong(),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "Your imported Spotify history and Onyx listening activity combined.",
+            )
+            .color(egui::Color32::from_rgb(179, 179, 179))
+            .size(13.0),
+        );
+        ui.add_space(14.0);
+        self.render_stats_range_controls(ui);
+    }
+
+    fn render_summary_cards(&self, ui: &mut egui::Ui) {
+        let available = ui.available_width();
+        if available < 560.0 {
+            summary_card(
+                ui,
+                "Time listened",
+                &format_total_duration(self.listening_stats.total_listening_time_ms),
+                available,
+            );
+            ui.add_space(12.0);
+            summary_card(
+                ui,
+                "Tracks played",
+                &self.listening_stats.total_plays.to_string(),
+                available,
+            );
+        } else {
+            let gap = 12.0;
+            let card_width = (available - gap) / 2.0;
+            ui.horizontal(|ui| {
+                summary_card(
+                    ui,
+                    "Time listened",
+                    &format_total_duration(self.listening_stats.total_listening_time_ms),
+                    card_width,
+                );
+                ui.add_space(gap);
+                summary_card(
+                    ui,
+                    "Tracks played",
+                    &self.listening_stats.total_plays.to_string(),
+                    card_width,
+                );
+            });
+        }
+    }
+
+    fn render_stats_range_controls(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            changed |= range_mode_button(
+                ui,
+                &mut self.stats_range_mode,
+                StatsRangeMode::AllTime,
+                "All time",
+            );
+            changed |=
+                range_mode_button(ui, &mut self.stats_range_mode, StatsRangeMode::Year, "Year");
+            changed |= range_mode_button(
+                ui,
+                &mut self.stats_range_mode,
+                StatsRangeMode::Month,
+                "Month",
+            );
+
+            ui.add_space(10.0);
+            let years = if self.listening_stats.available_years.is_empty() {
+                vec![self.selected_stats_year]
+            } else {
+                self.listening_stats.available_years.clone()
+            };
+            egui::ComboBox::from_id_salt("stats_year")
+                .selected_text(self.selected_stats_year.to_string())
+                .width(92.0)
+                .show_ui(ui, |ui| {
+                    for year in years {
+                        if ui
+                            .selectable_value(&mut self.selected_stats_year, year, year.to_string())
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    }
+                });
+
+            if self.stats_range_mode == StatsRangeMode::Month {
+                let months = if self.listening_stats.available_months.is_empty() {
+                    vec![self.selected_stats_month]
+                } else {
+                    self.listening_stats.available_months.clone()
+                };
+                egui::ComboBox::from_id_salt("stats_month")
+                    .selected_text(month_name(self.selected_stats_month))
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        for month in months {
+                            if ui
+                                .selectable_value(
+                                    &mut self.selected_stats_month,
+                                    month,
+                                    month_name(month),
+                                )
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                        }
+                    });
+            }
+        });
+
+        if changed {
+            self.refresh_listening_stats();
+        }
+    }
+
+    fn render_ranked_card(&mut self, ui: &mut egui::Ui, title: &str, kind: RankingKind) {
+        let (metric, limit, items) = match kind {
+            RankingKind::Tracks => (
+                self.track_stats_metric,
+                self.track_stats_limit,
+                self.listening_stats.top_tracks.clone(),
+            ),
+            RankingKind::Artists => (
+                self.artist_stats_metric,
+                self.artist_stats_limit,
+                self.listening_stats.top_artists.clone(),
+            ),
+        };
+
+        let response = render_bar_rankings(ui, title, &items, metric, limit, true);
+        let mut changed = false;
+        match kind {
+            RankingKind::Tracks => {
+                if response.metric_changed {
+                    self.track_stats_metric = toggle_metric(self.track_stats_metric);
+                    changed = true;
+                }
+                if response.show_more {
+                    self.track_stats_limit = next_stats_limit(self.track_stats_limit);
+                    changed = true;
+                }
+                if response.show_less {
+                    self.track_stats_limit = 10;
+                    changed = true;
+                }
+            }
+            RankingKind::Artists => {
+                if response.metric_changed {
+                    self.artist_stats_metric = toggle_metric(self.artist_stats_metric);
+                    changed = true;
+                }
+                if response.show_more {
+                    self.artist_stats_limit = next_stats_limit(self.artist_stats_limit);
+                    changed = true;
+                }
+                if response.show_less {
+                    self.artist_stats_limit = 10;
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            self.refresh_listening_stats();
+        }
+    }
+
+    fn import_spotify_history_from_picker(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Spotify history zip", &["zip"])
+            .set_title("Import Spotify Listening History")
+            .pick_file()
+        else {
+            return;
+        };
+
+        let import_result = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to access listening stats database."))
+            .and_then(|db_lock| db_lock.import_spotify_history_zip(&path.display().to_string()));
+
+        match import_result {
+            Ok(imported) => {
+                self.settings_status = Some(format!(
+                    "Imported {} new plays from {}.",
+                    imported,
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("Spotify history")
+                ));
+                self.refresh_listening_stats();
+            }
+            Err(e) => {
+                self.settings_status = Some(format!("Failed to import Spotify history: {}", e));
+            }
+        }
+    }
+
+    fn render_history_import_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading(egui::RichText::new("Listening History").color(egui::Color32::WHITE));
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(
+                "Import the ZIP from Spotify's privacy data export to combine older listening history with plays tracked in Onyx.",
+            )
+            .color(egui::Color32::from_rgb(179, 179, 179))
+            .size(13.0),
+        );
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new("Import Spotify ZIP")
+                        .fill(egui::Color32::from_rgb(30, 215, 96)),
+                )
+                .clicked()
+            {
+                self.import_spotify_history_from_picker();
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} plays, {} listened",
+                    self.listening_stats.total_plays,
+                    format_total_duration(self.listening_stats.total_listening_time_ms)
+                ))
+                .color(egui::Color32::from_rgb(179, 179, 179))
+                .size(12.0),
+            );
         });
     }
 
@@ -1571,6 +2035,9 @@ impl OnyxApp {
                     .size(13.0),
             );
             ui.add_space(20.0);
+
+            self.render_history_import_section(ui);
+            ui.add_space(28.0);
 
             ui.heading(egui::RichText::new("API Keys").color(egui::Color32::WHITE));
             ui.add_space(8.0);
@@ -1591,7 +2058,10 @@ impl OnyxApp {
 
             ui.horizontal(|ui| {
                 if ui
-                    .add(egui::Button::new("Save API Keys").fill(egui::Color32::from_rgb(30, 215, 96)))
+                    .add(
+                        egui::Button::new("Save API Keys")
+                            .fill(egui::Color32::from_rgb(30, 215, 96)),
+                    )
                     .clicked()
                 {
                     match self.config_draft.save() {
@@ -2180,6 +2650,7 @@ impl OnyxApp {
             return;
         }
         self.observed_end_count = state.end_count;
+        self.stats_refresh_due_at = Some(Instant::now() + Duration::from_secs(2));
         self.play_next();
     }
 
@@ -2791,6 +3262,282 @@ fn display_position_ms(state: &PlaybackState) -> u32 {
         .position_anchor_ms
         .saturating_add(elapsed_ms)
         .min(state.duration_ms.max(state.position_anchor_ms))
+}
+
+fn summary_card(ui: &mut egui::Ui, label: &str, value: &str, width: f32) {
+    let card_height = 110.0;
+    egui::Frame::default()
+        .fill(egui::Color32::from_rgb(31, 31, 31))
+        .corner_radius(10.0)
+        .inner_margin(egui::Margin::same(18))
+        .show(ui, |ui| {
+            ui.set_min_size(egui::vec2(width, card_height));
+            ui.set_width(width);
+            ui.label(
+                egui::RichText::new(label)
+                    .color(egui::Color32::from_rgb(179, 179, 179))
+                    .size(13.0),
+            );
+            ui.add_space(14.0);
+            ui.label(
+                egui::RichText::new(value)
+                    .color(egui::Color32::WHITE)
+                    .size(34.0)
+                    .strong(),
+            );
+        });
+}
+
+struct RankingResponse {
+    metric_changed: bool,
+    show_more: bool,
+    show_less: bool,
+}
+
+const RANKING_ROW_HEIGHT: f32 = 31.0;
+const RANKING_VALUE_WIDTH: f32 = 112.0;
+const RANKING_RIGHT_GUTTER: f32 = 18.0;
+const RANKING_ROW_RIGHT_INSET: f32 = 10.0;
+
+fn render_bar_rankings(
+    ui: &mut egui::Ui,
+    title: &str,
+    items: &[RankedItem],
+    metric: StatsMetric,
+    limit: u32,
+    show_controls: bool,
+) -> RankingResponse {
+    let mut response = RankingResponse {
+        metric_changed: false,
+        show_more: false,
+        show_less: false,
+    };
+    egui::Frame::default()
+        .fill(egui::Color32::from_rgb(31, 31, 31))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::same(16))
+        .show(ui, |ui| {
+            ui.set_width((ui.available_width() - 2.0).max(260.0));
+            ui.set_min_width(260.0);
+            ui.horizontal(|ui| {
+                ui.heading(
+                    egui::RichText::new(title)
+                        .color(egui::Color32::WHITE)
+                        .size(18.0),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if show_controls {
+                        if ui
+                            .add(metric_toggle_button(metric))
+                            .on_hover_text("Toggle between plays and time")
+                            .clicked()
+                        {
+                            response.metric_changed = true;
+                        }
+                    }
+                });
+            });
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(format!("Showing top {}", items.len().min(limit as usize)))
+                    .color(egui::Color32::from_rgb(130, 130, 130))
+                    .size(11.0),
+            );
+            ui.add_space(10.0);
+
+            if items.is_empty() {
+                ui.label(
+                    egui::RichText::new("No data yet")
+                        .color(egui::Color32::from_rgb(179, 179, 179))
+                        .size(13.0),
+                );
+                return;
+            }
+
+            let max_value = items
+                .first()
+                .map(|item| ranking_value(item, metric))
+                .unwrap_or(1)
+                .max(1);
+
+            if items.len() > 10 {
+                let list_height = 10.0 * RANKING_ROW_HEIGHT;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), list_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_height(list_height);
+                        egui::ScrollArea::vertical()
+                            .id_salt(format!("{}_ranking_rows", title))
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(
+                                    (ui.available_width() - RANKING_ROW_RIGHT_INSET).max(120.0),
+                                );
+                                for (index, item) in items.iter().enumerate() {
+                                    render_bar_row(ui, index, item, metric, max_value);
+                                }
+                            });
+                    },
+                );
+            } else {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(
+                        ui.available_width(),
+                        items.len() as f32 * RANKING_ROW_HEIGHT,
+                    ),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        for (index, item) in items.iter().enumerate() {
+                            render_bar_row(ui, index, item, metric, max_value);
+                        }
+                    },
+                );
+            }
+
+            if show_controls {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new("Show more")).clicked() {
+                        response.show_more = true;
+                    }
+                    if limit > 10 && ui.add(egui::Button::new("Show less")).clicked() {
+                        response.show_less = true;
+                    }
+                });
+            }
+        });
+    response
+}
+
+fn render_bar_row(
+    ui: &mut egui::Ui,
+    index: usize,
+    item: &RankedItem,
+    metric: StatsMetric,
+    max_value: u64,
+) {
+    let row_width = (ui.available_width() - RANKING_ROW_RIGHT_INSET).max(120.0);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(row_width, RANKING_ROW_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let value = ranking_value(item, metric);
+    let fraction = (value as f32 / max_value as f32).clamp(0.04, 1.0);
+    let chart_right = (rect.right() - RANKING_VALUE_WIDTH - RANKING_RIGHT_GUTTER).max(rect.left());
+    let chart_rect = egui::Rect::from_min_max(rect.min, egui::pos2(chart_right, rect.bottom()));
+    let bar_rect = egui::Rect::from_min_size(
+        chart_rect.min,
+        egui::vec2(chart_rect.width() * fraction, rect.height() - 3.0),
+    );
+    ui.painter()
+        .rect_filled(bar_rect, 5.0, egui::Color32::from_rgb(64, 64, 64));
+
+    let text_rect = rect.shrink2(egui::vec2(10.0, 0.0));
+    let rank_rect = egui::Rect::from_min_size(text_rect.min, egui::vec2(28.0, text_rect.height()));
+    let value_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            text_rect.right() - RANKING_VALUE_WIDTH - RANKING_RIGHT_GUTTER,
+            text_rect.top(),
+        ),
+        egui::vec2(RANKING_VALUE_WIDTH, text_rect.height()),
+    );
+    let name_rect = egui::Rect::from_min_max(
+        egui::pos2(rank_rect.right() + 4.0, text_rect.top()),
+        egui::pos2(value_rect.left() - 8.0, text_rect.bottom()),
+    );
+    paint_left_text(
+        ui,
+        rank_rect,
+        &format!("{}.", index + 1),
+        egui::Color32::from_rgb(190, 190, 190),
+        13.0,
+        false,
+    );
+    paint_left_text(ui, name_rect, &item.name, egui::Color32::WHITE, 13.0, false);
+    paint_right_text(
+        ui,
+        value_rect,
+        &ranking_value_label(item, metric),
+        egui::Color32::from_rgb(210, 210, 210),
+        12.0,
+    );
+}
+
+fn metric_toggle_button(metric: StatsMetric) -> egui::Button<'static> {
+    let label = match metric {
+        StatsMetric::Plays => "Plays",
+        StatsMetric::Time => "Time",
+    };
+    egui::Button::new(label).fill(egui::Color32::from_rgb(45, 45, 45))
+}
+
+fn range_mode_button(
+    ui: &mut egui::Ui,
+    value: &mut StatsRangeMode,
+    option: StatsRangeMode,
+    label: &str,
+) -> bool {
+    let selected = *value == option;
+    let button = egui::Button::new(label).fill(if selected {
+        egui::Color32::from_rgb(30, 215, 96)
+    } else {
+        egui::Color32::from_rgb(38, 38, 38)
+    });
+    if ui.add(button).clicked() {
+        let changed = *value != option;
+        *value = option;
+        return changed;
+    }
+    false
+}
+
+fn toggle_metric(metric: StatsMetric) -> StatsMetric {
+    match metric {
+        StatsMetric::Plays => StatsMetric::Time,
+        StatsMetric::Time => StatsMetric::Plays,
+    }
+}
+
+fn next_stats_limit(limit: u32) -> u32 {
+    match limit {
+        0..=10 => 25,
+        11..=25 => 50,
+        _ => 100,
+    }
+}
+
+fn ranking_value(item: &RankedItem, metric: StatsMetric) -> u64 {
+    match metric {
+        StatsMetric::Plays => u64::from(item.plays),
+        StatsMetric::Time => item.duration_ms,
+    }
+}
+
+fn ranking_value_label(item: &RankedItem, metric: StatsMetric) -> String {
+    match metric {
+        StatsMetric::Plays => format!("{} plays", item.plays),
+        StatsMetric::Time => format_total_duration(item.duration_ms),
+    }
+}
+
+fn month_name(month: u32) -> String {
+    match month {
+        1 => "January",
+        2 => "February",
+        3 => "March",
+        4 => "April",
+        5 => "May",
+        6 => "June",
+        7 => "July",
+        8 => "August",
+        9 => "September",
+        10 => "October",
+        11 => "November",
+        12 => "December",
+        _ => "Month",
+    }
+    .to_string()
 }
 
 fn format_duration(duration_ms: u32) -> String {
