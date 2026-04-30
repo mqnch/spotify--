@@ -7,7 +7,11 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection};
+use serde::Deserialize;
+use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
+use zip::ZipArchive;
 
 // ───────────────────────────────────────────────────────────────────
 // Data Models
@@ -26,6 +30,29 @@ pub struct Scrobble {
 pub struct TopItem {
     pub name: String,
     pub count: u32,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+enum SpotifyHistoryEntry {
+    Standard {
+        #[serde(rename = "endTime")]
+        end_time: String,
+        #[serde(rename = "artistName")]
+        artist_name: String,
+        #[serde(rename = "trackName")]
+        track_name: String,
+        #[serde(rename = "msPlayed")]
+        ms_played: u32,
+    },
+    Extended {
+        ts: String,
+        master_metadata_album_artist_name: Option<String>,
+        master_metadata_track_name: Option<String>,
+        master_metadata_album_album_name: Option<String>,
+        spotify_track_uri: Option<String>,
+        ms_played: u32,
+    },
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -102,6 +129,73 @@ impl TelemetryDb {
         )?;
 
         Ok(())
+    }
+
+    /// Import scrobbles from a Spotify data export ZIP file.
+    pub fn import_spotify_history_zip(&self, path: &str) -> Result<usize> {
+        let file = File::open(path).context("Failed to open zip file")?;
+        let mut archive = ZipArchive::new(file).context("Failed to parse zip archive")?;
+
+        let mut count = 0;
+        
+        // Execute manually to avoid requiring &mut Connection for a Transaction
+        self.conn.execute("BEGIN TRANSACTION", [])?;
+
+        for i in 0..archive.len() {
+            let mut file = match archive.by_index(i) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            if !file.is_file() {
+                continue;
+            }
+            
+            let name = file.name().to_string();
+            if name.ends_with(".json") && (name.contains("StreamingHistory") || name.contains("Streaming_History")) {
+                let mut content = String::new();
+                if file.read_to_string(&mut content).is_err() {
+                    continue;
+                }
+
+                let entries: Vec<SpotifyHistoryEntry> = match serde_json::from_str(&content) {
+                    Ok(e) => e,
+                    Err(_) => continue, // skip files that don't match our schema
+                };
+
+                for entry in entries {
+                    let (track_name, artist_name, album_name, duration_ms, spotify_uri, ts) = match entry {
+                        SpotifyHistoryEntry::Standard { end_time, artist_name, track_name, ms_played } => {
+                            (track_name, artist_name, String::new(), ms_played, String::new(), end_time)
+                        }
+                        SpotifyHistoryEntry::Extended { ts, master_metadata_album_artist_name, master_metadata_track_name, master_metadata_album_album_name, spotify_track_uri, ms_played } => {
+                            let track = master_metadata_track_name.unwrap_or_default();
+                            let artist = master_metadata_album_artist_name.unwrap_or_default();
+                            let album = master_metadata_album_album_name.unwrap_or_default();
+                            let uri = spotify_track_uri.unwrap_or_default();
+                            (track, artist, album, ms_played, uri, ts)
+                        }
+                    };
+
+                    if duration_ms < 30_000 || track_name.is_empty() || artist_name.is_empty() {
+                        continue; // Skip short plays and podcasts
+                    }
+
+                    if let Err(_) = self.conn.execute(
+                        "INSERT INTO listening_history (timestamp, track_name, artist_name, album_name, duration_ms, spotify_uri)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![ts, track_name, artist_name, album_name, duration_ms, spotify_uri],
+                    ) {
+                        // ignore individual insert errors inside bulk operation
+                    } else {
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        self.conn.execute("COMMIT", [])?;
+
+        Ok(count)
     }
 
     // ───────────────────────────────────────────────────────────────────

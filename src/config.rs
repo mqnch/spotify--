@@ -7,15 +7,15 @@
 use anyhow::{Context, Result};
 use std::io::{self, Write};
 
+use serde::{Deserialize, Serialize};
+
 const SERVICE_NAME: &str = "onyx";
 
-/// Keys we store in the system keyring.
-const KEY_SPOTIFY_CLIENT_ID: &str = "spotify_client_id";
-const KEY_SPOTIFY_CLIENT_SECRET: &str = "spotify_client_secret";
-const KEY_LASTFM_API_KEY: &str = "lastfm_api_key";
+/// Key we store in the system keyring.
+const KEY_CONFIG: &str = "api_keys";
 
 /// Holds the three API keys required by Onyx.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub spotify_client_id: String,
     pub spotify_client_secret: String,
@@ -26,15 +26,15 @@ pub struct AppConfig {
 // Keyring helpers
 // ---------------------------------------------------------------------------
 
-/// Read a single key from the OS keyring. Returns `None` if not found.
-fn keyring_get(key: &str) -> Option<String> {
-    let entry = keyring::Entry::new(SERVICE_NAME, key).ok()?;
+/// Read the config from the OS keyring. Returns `None` if not found.
+fn keyring_get() -> Option<String> {
+    let entry = keyring::Entry::new(SERVICE_NAME, KEY_CONFIG).ok()?;
     entry.get_password().ok()
 }
 
-/// Write a single key to the OS keyring.
-fn keyring_set(key: &str, value: &str) -> Result<()> {
-    let entry = keyring::Entry::new(SERVICE_NAME, key)
+/// Write the config to the OS keyring.
+fn keyring_set(value: &str) -> Result<()> {
+    let entry = keyring::Entry::new(SERVICE_NAME, KEY_CONFIG)
         .context("Failed to create keyring entry")?;
     entry
         .set_password(value)
@@ -47,25 +47,16 @@ fn keyring_set(key: &str, value: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 impl AppConfig {
-    /// Attempt to load all three keys from the OS keyring.
-    /// Returns `None` if any key is missing.
+    /// Attempt to load the keys from the OS keyring.
     pub fn load() -> Option<Self> {
-        let spotify_client_id = keyring_get(KEY_SPOTIFY_CLIENT_ID)?;
-        let spotify_client_secret = keyring_get(KEY_SPOTIFY_CLIENT_SECRET)?;
-        let lastfm_api_key = keyring_get(KEY_LASTFM_API_KEY)?;
-
-        Some(Self {
-            spotify_client_id,
-            spotify_client_secret,
-            lastfm_api_key,
-        })
+        let json_str = keyring_get()?;
+        serde_json::from_str(&json_str).ok()
     }
 
-    /// Persist all keys to the OS keyring.
+    /// Persist all keys to the OS keyring as a single JSON blob.
     pub fn save(&self) -> Result<()> {
-        keyring_set(KEY_SPOTIFY_CLIENT_ID, &self.spotify_client_id)?;
-        keyring_set(KEY_SPOTIFY_CLIENT_SECRET, &self.spotify_client_secret)?;
-        keyring_set(KEY_LASTFM_API_KEY, &self.lastfm_api_key)?;
+        let json_str = serde_json::to_string(self)?;
+        keyring_set(&json_str)?;
         Ok(())
     }
 

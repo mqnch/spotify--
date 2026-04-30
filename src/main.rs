@@ -4,6 +4,7 @@ mod lastfm;
 mod metadata;
 mod player;
 mod spotify_api;
+mod telemetry;
 
 use anyhow::Result;
 use librespot::playback::player::PlayerEvent;
@@ -42,7 +43,10 @@ async fn main() -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PlayerEvent>();
     let audio = player::AudioEngine::start(event_tx).await?;
 
-    // ── Step 4: Event listener (placeholder — will feed telemetry) ───
+    // ── Step 4: Event listener (Telemetry Engine) ────────────────────
+    let db = telemetry::TelemetryDb::new()?;
+    let spotify_clone = spotify.clone();
+
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
             match &event {
@@ -62,6 +66,31 @@ async fn main() -> Result<()> {
                 }
                 PlayerEvent::EndOfTrack { track_id, .. } => {
                     log::info!("⏹ End of track {:?}", track_id);
+                    
+                    // Phase 4: Scrobble logic
+                    let id_str = track_id.to_base62().unwrap_or_default();
+                    if let Ok(rspotify_id) = rspotify::model::TrackId::from_id(id_str.as_str()) {
+                        match spotify_clone.track(rspotify_id, None).await {
+                            Ok(track_obj) => {
+                                let artist_name = track_obj.artists.first().map(|a| a.name.clone()).unwrap_or_default();
+                                let scrobble = telemetry::Scrobble {
+                                    track_name: track_obj.name.clone(),
+                                    artist_name: artist_name.clone(),
+                                    album_name: track_obj.album.name.clone(),
+                                    duration_ms: track_obj.duration.num_milliseconds() as u32,
+                                    spotify_uri: track_obj.id.map(|id| id.uri()).unwrap_or_default(),
+                                };
+                                if let Err(e) = db.record_scrobble(&scrobble) {
+                                    log::error!("Failed to record scrobble: {}", e);
+                                } else {
+                                    log::info!("📝 Scrobbled: {} - {}", scrobble.artist_name, scrobble.track_name);
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("Failed to fetch track metadata for scrobble: {}", e);
+                            }
+                        }
+                    }
                 }
                 PlayerEvent::VolumeChanged { volume } => {
                     log::info!("🔊 Volume → {}", volume);

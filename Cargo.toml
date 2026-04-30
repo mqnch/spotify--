@@ -49,3 +49,4 @@ futures-util = "0.3"
 # Local Telemetry Database
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = "0.4"
+zip = "8.6.0"
