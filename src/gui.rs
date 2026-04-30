@@ -218,12 +218,12 @@ pub struct OnyxApp {
     last_queue_load_at: Option<Instant>,
     observed_end_count: u64,
     stats_refresh_due_at: Option<Instant>,
-    last_sent_volume: u16,
-    previous_volume: u16,
 
     // Playback state toggles
     shuffle: bool,
     repeat: bool,
+
+    now_playing_flyout_open: bool,
 }
 
 impl OnyxApp {
@@ -395,10 +395,9 @@ impl OnyxApp {
             last_queue_load_at: None,
             observed_end_count: 0,
             stats_refresh_due_at: None,
-            last_sent_volume: u16::MAX,
-            previous_volume: u16::MAX,
             shuffle: false,
             repeat: false,
+            now_playing_flyout_open: false,
         }
     }
 
@@ -669,7 +668,6 @@ impl eframe::App for OnyxApp {
         self.advance_queue_after_track_end(&state);
         self.flush_pending_queue_load();
         state = self.playback_state.lock().unwrap().clone();
-        let display_position_ms = display_position_ms(&state);
 
         if state.is_playing {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -683,409 +681,6 @@ impl eframe::App for OnyxApp {
         } else if self.stats_refresh_due_at.is_some() {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
-
-        // BOTTOM BAR (#181818)
-        let mut bottom_frame = egui::Frame::default();
-        bottom_frame.fill = egui::Color32::from_rgb(24, 24, 24);
-        bottom_frame.inner_margin = egui::Margin::same(8);
-
-        egui::TopBottomPanel::bottom("bottom_bar")
-            .exact_height(80.0)
-            .frame(bottom_frame)
-            .show(ctx, |ui| {
-                let available = ui.available_rect_before_wrap();
-                let w = available.width();
-                let w_left = (w * 0.3).round();
-                let w_center = (w * 0.4).round();
-                let w_right = w - w_left - w_center;
-
-                let left_rect = egui::Rect::from_min_size(
-                    available.min,
-                    egui::vec2(w_left, available.height()),
-                );
-                let center_rect = egui::Rect::from_min_size(
-                    left_rect.right_top(),
-                    egui::vec2(w_center, available.height()),
-                );
-                let right_rect = egui::Rect::from_min_size(
-                    center_rect.right_top(),
-                    egui::vec2(w_right, available.height()),
-                );
-
-                // Left Section
-                ui.allocate_ui_at_rect(left_rect, |ui| {
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.add_space(8.0); // push track image right just enough to align with sidebar (8 + 8 = 16)
-                        if let Some(url) = &state.artwork_url {
-                            ui.add(
-                                egui::Image::new(url)
-                                    .corner_radius(4_u8)
-                                    .fit_to_exact_size(egui::vec2(56.0, 56.0)),
-                            );
-                        } else {
-                            let (rect, _) = ui
-                                .allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
-                            ui.painter().rect_filled(
-                                rect,
-                                4.0,
-                                egui::Color32::from_rgb(40, 40, 40),
-                            );
-                        }
-
-                        ui.add_space(12.0);
-                        ui.vertical(|ui| {
-                            ui.add_space(10.0); // vertically align
-                            if state.track_name.is_empty() {
-                                ui.label(
-                                    egui::RichText::new("No track playing")
-                                        .color(egui::Color32::WHITE)
-                                        .strong(),
-                                );
-                            } else {
-                                ui.label(
-                                    egui::RichText::new(&state.track_name)
-                                        .color(egui::Color32::WHITE)
-                                        .strong(),
-                                );
-                                ui.label(
-                                    egui::RichText::new(&state.artist_name)
-                                        .color(egui::Color32::from_rgb(179, 179, 179))
-                                        .size(12.0),
-                                );
-                            }
-                        });
-                    });
-                });
-
-                // Center Section
-                ui.allocate_ui_at_rect(center_rect, |ui| {
-                    ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                        // Nudge transport controls slightly lower for visual centering.
-                        ui.add_space(4.0);
-                        // Controls Row
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(center_rect.width(), 30.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                let spacing = 13.0;
-                                let btn_w = 24.0;
-                                let play_w = 30.0;
-                                let total_w = 4.0 * btn_w + play_w + 4.0 * spacing;
-
-                                // Push to center
-                                let center_space =
-                                    ((center_rect.width() - total_w) / 2.0).max(0.0).floor();
-                                ui.add_space(center_space);
-                                ui.spacing_mut().item_spacing.x = spacing;
-
-                                let shuffle_color = if self.shuffle {
-                                    egui::Color32::from_rgb(30, 215, 96)
-                                } else {
-                                    egui::Color32::from_rgb(179, 179, 179)
-                                };
-                                if ui
-                                    .add_sized(
-                                        [btn_w, btn_w],
-                                        egui::Button::new(
-                                            egui::RichText::new("🔀")
-                                                .size(14.0)
-                                                .color(shuffle_color),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .clicked()
-                                {
-                                    self.toggle_shuffle();
-                                }
-                                if ui
-                                    .add_sized(
-                                        [btn_w, btn_w],
-                                        egui::Button::new(egui::RichText::new("⏮").size(14.0))
-                                            .frame(false),
-                                    )
-                                    .clicked()
-                                {
-                                    self.play_previous();
-                                }
-
-                                if play_pause_button(
-                                    ui,
-                                    play_w,
-                                    state.is_playing,
-                                    egui::Color32::WHITE,
-                                    egui::Color32::BLACK,
-                                )
-                                .clicked()
-                                {
-                                    if state.is_playing {
-                                        self.update_position_immediately(
-                                            display_position_ms,
-                                            false,
-                                        );
-                                        let _ = self.audio_cmd_tx.send(AudioCmd::Pause);
-                                    } else {
-                                        self.update_position_immediately(display_position_ms, true);
-                                        let _ = self.audio_cmd_tx.send(AudioCmd::Play);
-                                    }
-                                }
-
-                                if ui
-                                    .add_sized(
-                                        [btn_w, btn_w],
-                                        egui::Button::new(egui::RichText::new("⏭").size(14.0))
-                                            .frame(false),
-                                    )
-                                    .clicked()
-                                {
-                                    self.play_next();
-                                }
-                                let repeat_color = if self.repeat {
-                                    egui::Color32::from_rgb(30, 215, 96)
-                                } else {
-                                    egui::Color32::from_rgb(179, 179, 179)
-                                };
-                                if ui
-                                    .add_sized(
-                                        [btn_w, btn_w],
-                                        egui::Button::new(
-                                            egui::RichText::new("🔁")
-                                                .size(14.0)
-                                                .color(repeat_color),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .clicked()
-                                {
-                                    self.repeat = !self.repeat;
-                                }
-                            },
-                        );
-
-                        ui.add_space(0.0);
-                        // Progress Row
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(center_rect.width(), 18.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                let mins = display_position_ms / 60000;
-                                let secs = (display_position_ms / 1000) % 60;
-                                let time_text = format!("{}:{:02}", mins, secs);
-
-                                let time_w = 30.0;
-                                let pb_width =
-                                    (center_rect.width() - (time_w * 2.0) - 32.0).max(10.0);
-
-                                let center_space = ((center_rect.width()
-                                    - (pb_width + time_w * 2.0 + 16.0))
-                                    / 2.0)
-                                    .max(0.0)
-                                    .floor();
-                                ui.add_space(center_space);
-
-                                ui.add_sized(
-                                    [time_w, 12.0],
-                                    egui::Label::new(
-                                        egui::RichText::new(time_text)
-                                            .size(11.0)
-                                            .color(egui::Color32::from_rgb(179, 179, 179)),
-                                    ),
-                                );
-
-                                ui.spacing_mut().item_spacing.x = 8.0;
-
-                                let (rect, resp) = ui.allocate_exact_size(
-                                    egui::vec2(pb_width, 4.0),
-                                    egui::Sense::click_and_drag(),
-                                );
-                                if resp.clicked() || resp.dragged() {
-                                    if let Some(pos) = resp.interact_pointer_pos() {
-                                        let x = (pos.x - rect.left()).clamp(0.0, pb_width);
-                                        let pct = x / pb_width;
-                                        let duration = state.duration_ms.max(1) as f32;
-                                        let new_pos = (pct * duration) as u32;
-                                        self.update_position_immediately(new_pos, state.is_playing);
-                                        let _ = self.audio_cmd_tx.send(AudioCmd::Seek {
-                                            position_ms: new_pos,
-                                        });
-                                    }
-                                }
-                                ui.painter().rect_filled(
-                                    rect,
-                                    2.0,
-                                    egui::Color32::from_rgb(83, 83, 83),
-                                );
-                                let mut filled_rect = rect;
-                                let pct = if state.duration_ms > 0 {
-                                    (display_position_ms as f32 / state.duration_ms as f32)
-                                        .clamp(0.0, 1.0)
-                                } else {
-                                    0.0
-                                };
-                                filled_rect.set_width(pb_width * pct);
-                                ui.painter()
-                                    .rect_filled(filled_rect, 2.0, egui::Color32::WHITE);
-
-                                let remaining = state
-                                    .duration_ms
-                                    .saturating_sub(display_position_ms.min(state.duration_ms));
-                                ui.add_sized(
-                                    [time_w, 12.0],
-                                    egui::Label::new(
-                                        egui::RichText::new(format!(
-                                            "-{}",
-                                            format_duration(remaining)
-                                        ))
-                                        .size(11.0)
-                                        .color(egui::Color32::from_rgb(179, 179, 179)),
-                                    ),
-                                );
-                            },
-                        );
-                    });
-                });
-
-                // Right Section
-                ui.allocate_ui_at_rect(right_rect, |ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(24.0);
-
-                        let btn_w = 24.0;
-
-                        // Fullscreen Icon
-                        let (rect, resp) =
-                            ui.allocate_exact_size(egui::vec2(btn_w, btn_w), egui::Sense::click());
-                        let color = if resp.hovered() {
-                            egui::Color32::WHITE
-                        } else {
-                            egui::Color32::from_rgb(179, 179, 179)
-                        };
-                        let p = ui.painter();
-                        let m = rect.center() - egui::vec2(6.0, 6.0);
-                        let s = 12.0;
-                        let stroke = (1.5, color);
-                        p.line_segment([m, m + egui::vec2(4.0, 0.0)], stroke);
-                        p.line_segment([m, m + egui::vec2(0.0, 4.0)], stroke);
-                        p.line_segment(
-                            [m + egui::vec2(s - 4.0, 0.0), m + egui::vec2(s, 0.0)],
-                            stroke,
-                        );
-                        p.line_segment([m + egui::vec2(s, 0.0), m + egui::vec2(s, 4.0)], stroke);
-                        p.line_segment(
-                            [m + egui::vec2(0.0, s - 4.0), m + egui::vec2(0.0, s)],
-                            stroke,
-                        );
-                        p.line_segment([m + egui::vec2(0.0, s), m + egui::vec2(4.0, s)], stroke);
-                        p.line_segment([m + egui::vec2(s - 4.0, s), m + egui::vec2(s, s)], stroke);
-                        p.line_segment([m + egui::vec2(s, s - 4.0), m + egui::vec2(s, s)], stroke);
-
-                        let vol_w = 80.0;
-                        let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(vol_w, 4.0),
-                            egui::Sense::click_and_drag(),
-                        );
-                        if response.dragged() || response.clicked() {
-                            if let Some(pos) = response.interact_pointer_pos() {
-                                let x = (pos.x - rect.left()).clamp(0.0, vol_w);
-                                let vol_pct = x / vol_w;
-                                let new_vol = (vol_pct * 65535.0) as u16;
-                                if new_vol != state.volume {
-                                    state.volume = new_vol;
-                                    if new_vol > 0 {
-                                        self.previous_volume = new_vol;
-                                    }
-                                    self.set_volume_immediately(new_vol, true);
-                                }
-                            }
-                        }
-
-                        ui.painter()
-                            .rect_filled(rect, 2.0, egui::Color32::from_rgb(83, 83, 83));
-                        let mut filled_rect = rect;
-                        filled_rect.set_width(vol_w * (state.volume as f32 / 65535.0));
-                        ui.painter()
-                            .rect_filled(filled_rect, 2.0, egui::Color32::WHITE);
-
-                        let (rect, resp) =
-                            ui.allocate_exact_size(egui::vec2(btn_w, btn_w), egui::Sense::click());
-                        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-                        if resp.clicked() {
-                            if state.volume == 0 {
-                                let restore = self.previous_volume.max(1);
-                                state.volume = restore;
-                                self.set_volume_immediately(restore, true);
-                            } else {
-                                self.previous_volume = state.volume;
-                                state.volume = 0;
-                                self.set_volume_immediately(0, true);
-                            }
-                        }
-                        paint_volume_icon(ui, rect, state.volume == 0, resp.hovered());
-
-                        // Device Icon
-                        let (rect, resp) =
-                            ui.allocate_exact_size(egui::vec2(btn_w, btn_w), egui::Sense::click());
-                        let color = if resp.hovered() {
-                            egui::Color32::WHITE
-                        } else {
-                            egui::Color32::from_rgb(179, 179, 179)
-                        };
-                        let c = rect.center();
-                        let stroke = (1.5, color);
-                        ui.painter().rect_stroke(
-                            egui::Rect::from_center_size(
-                                c - egui::vec2(0.0, 1.0),
-                                egui::vec2(14.0, 10.0),
-                            ),
-                            1.0,
-                            stroke,
-                            egui::StrokeKind::Middle,
-                        );
-                        ui.painter().line_segment(
-                            [c + egui::vec2(-4.0, 7.0), c + egui::vec2(4.0, 7.0)],
-                            stroke,
-                        );
-                        ui.painter().line_segment(
-                            [c + egui::vec2(0.0, 4.0), c + egui::vec2(0.0, 7.0)],
-                            stroke,
-                        );
-
-                        // Queue Icon
-                        let (rect, resp) =
-                            ui.allocate_exact_size(egui::vec2(btn_w, btn_w), egui::Sense::click());
-                        let color = if resp.hovered() {
-                            egui::Color32::WHITE
-                        } else {
-                            egui::Color32::from_rgb(179, 179, 179)
-                        };
-                        let c = rect.center();
-                        let stroke = (1.5, color);
-                        ui.painter().line_segment(
-                            [c + egui::vec2(-6.0, -4.0), c + egui::vec2(6.0, -4.0)],
-                            stroke,
-                        );
-                        ui.painter().line_segment(
-                            [c + egui::vec2(-6.0, 0.0), c + egui::vec2(6.0, 0.0)],
-                            stroke,
-                        );
-                        ui.painter().line_segment(
-                            [c + egui::vec2(-6.0, 4.0), c + egui::vec2(1.0, 4.0)],
-                            stroke,
-                        );
-                        ui.painter().line_segment(
-                            [c + egui::vec2(3.0, 2.0), c + egui::vec2(3.0, 6.0)],
-                            stroke,
-                        );
-                        ui.painter().line_segment(
-                            [c + egui::vec2(3.0, 2.0), c + egui::vec2(7.0, 4.0)],
-                            stroke,
-                        );
-                        ui.painter().line_segment(
-                            [c + egui::vec2(3.0, 6.0), c + egui::vec2(7.0, 4.0)],
-                            stroke,
-                        );
-                    });
-                });
-            });
 
         // SIDEBAR (#000000)
         let mut side_frame = egui::Frame::default();
@@ -1373,10 +968,115 @@ impl eframe::App for OnyxApp {
                     MainView::Dashboard => self.render_dashboard_view(ui),
                 }
             });
+
+        self.render_now_playing_flyout(ctx, &state);
     }
 }
 
 impl OnyxApp {
+    fn render_now_playing_flyout(&mut self, ctx: &egui::Context, state: &PlaybackState) {
+        const FLYOUT_ANIM_SEC: f32 = 0.38;
+        const VIEWPORT_BOTTOM_MARGIN: f32 = 24.0;
+        const EDGE_MARGIN: f32 = 16.0;
+        const SLIDE_SLOP: f32 = 28.0;
+        const FLYOUT_W: f32 = 280.0;
+        const ART: f32 = 232.0;
+        const PAD: f32 = 20.0;
+        const TEXT_BLOCK_H: f32 = 76.0;
+        let panel_h = PAD + ART + 16.0 + TEXT_BLOCK_H + PAD;
+
+        let t = ctx.animate_bool_with_time_and_easing(
+            egui::Id::new("now_playing_flyout_anim"),
+            self.now_playing_flyout_open,
+            FLYOUT_ANIM_SEC,
+            egui::emath::easing::cubic_in_out,
+        );
+
+        if !self.now_playing_flyout_open && t < 1e-4 {
+            return;
+        }
+
+        let screen = ctx.content_rect();
+        let rest_x = screen.left() + EDGE_MARGIN;
+        let slide = (1.0 - t) * (FLYOUT_W + SLIDE_SLOP);
+        let x = rest_x - slide;
+        let y = screen.bottom() - VIEWPORT_BOTTOM_MARGIN - panel_h;
+
+        egui::Area::new(egui::Id::new("now_playing_flyout_panel"))
+            .order(egui::Order::Foreground)
+            .movable(false)
+            .fixed_pos(egui::pos2(x, y))
+            .show(ctx, |ui| {
+                // One opacity for frame background, artwork, and text (avoids background fading first).
+                ui.set_opacity(t.clamp(0.0, 1.0));
+
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(31, 31, 31))
+                    .corner_radius(12.0)
+                    .inner_margin(egui::Margin::same(PAD as i8))
+                    .show(ui, |ui| {
+                        ui.set_width(FLYOUT_W - 2.0 * PAD);
+
+                        if let Some(url) = &state.artwork_url {
+                            ui.add(
+                                egui::Image::new(url)
+                                    .corner_radius(8_u8)
+                                    .fit_to_exact_size(egui::vec2(ART, ART)),
+                            );
+                        } else {
+                            let (r, _) = ui.allocate_exact_size(
+                                egui::vec2(ART, ART),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter()
+                                .rect_filled(r, 8.0, egui::Color32::from_rgb(40, 40, 40));
+                        }
+
+                        ui.add_space(14.0);
+
+                        if state.track_name.is_empty() {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new("No track playing")
+                                        .color(egui::Color32::WHITE)
+                                        .size(17.0)
+                                        .strong(),
+                                )
+                                .wrap(),
+                            );
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new("—")
+                                        .color(egui::Color32::from_rgb(179, 179, 179))
+                                        .size(14.0),
+                                )
+                                .wrap(),
+                            );
+                        } else {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&state.track_name)
+                                        .color(egui::Color32::WHITE)
+                                        .size(17.0)
+                                        .strong(),
+                                )
+                                .wrap(),
+                            );
+                            ui.add_space(6.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&state.artist_name)
+                                        .color(egui::Color32::from_rgb(179, 179, 179))
+                                        .size(14.0),
+                                )
+                                .wrap(),
+                            );
+                        }
+                    });
+            });
+    }
+
     fn render_central_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1731,48 +1431,54 @@ impl OnyxApp {
             return;
         }
 
-        self.render_summary_cards(ui);
-        const STATS_SECTION_GAP: f32 = 12.0;
-        ui.add_space(STATS_SECTION_GAP);
+        const STATS_GRID_GAP: f32 = 12.0;
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            self.render_summary_cards(ui);
+            ui.add_space(STATS_GRID_GAP);
 
-        if ui.available_width() < 760.0 {
-            self.render_ranked_card(ui, "Top Tracks", RankingKind::Tracks);
-            ui.add_space(STATS_SECTION_GAP);
-            self.render_ranked_card(ui, "Top Artists", RankingKind::Artists);
-        } else {
-            let available = ui.available_width();
-            let col_width = (available - STATS_SECTION_GAP) / 2.0;
-            ui.horizontal(|ui| {
-                ui.allocate_ui(egui::vec2(col_width, 0.0), |ui| {
-                    ui.set_width(col_width);
-                    self.render_ranked_card(ui, "Top Tracks", RankingKind::Tracks);
-                });
-                ui.add_space(STATS_SECTION_GAP);
-                ui.allocate_ui(egui::vec2(col_width, 0.0), |ui| {
-                    ui.set_width(col_width);
-                    self.render_ranked_card(ui, "Top Artists", RankingKind::Artists);
-                });
-            });
-        }
-
-        if !self.listening_stats.top_albums.is_empty() {
-            ui.add_space(24.0);
-            let width = if ui.available_width() < 760.0 {
-                ui.available_width()
+            if ui.available_width() < 760.0 {
+                self.render_ranked_card(ui, "Top Tracks", RankingKind::Tracks);
+                ui.add_space(STATS_GRID_GAP);
+                self.render_ranked_card(ui, "Top Artists", RankingKind::Artists);
             } else {
-                (ui.available_width() - 12.0) / 2.0
-            };
-            ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
-                render_bar_rankings(
-                    ui,
-                    "Top Albums",
-                    &self.listening_stats.top_albums,
-                    StatsMetric::Plays,
-                    self.listening_stats.top_albums.len() as u32,
-                    false,
-                );
-            });
-        }
+                let available = ui.available_width();
+                let col_width = (available - STATS_GRID_GAP) / 2.0;
+                let col_layout = egui::Layout::top_down(egui::Align::Min);
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(egui::vec2(col_width, 0.0), col_layout, |ui| {
+                        ui.set_width(col_width);
+                        self.render_ranked_card(ui, "Top Tracks", RankingKind::Tracks);
+                    });
+                    ui.add_space(STATS_GRID_GAP);
+                    ui.allocate_ui_with_layout(egui::vec2(col_width, 0.0), col_layout, |ui| {
+                        ui.set_width(col_width);
+                        self.render_ranked_card(ui, "Top Artists", RankingKind::Artists);
+                    });
+                });
+            }
+
+            if !self.listening_stats.top_albums.is_empty() {
+                ui.add_space(STATS_GRID_GAP);
+                let width = if ui.available_width() < 760.0 {
+                    ui.available_width()
+                } else {
+                    (ui.available_width() - STATS_GRID_GAP) / 2.0
+                };
+                let col_layout = egui::Layout::top_down(egui::Align::Min);
+                ui.allocate_ui_with_layout(egui::vec2(width, 0.0), col_layout, |ui| {
+                    ui.set_width(width);
+                    render_bar_rankings(
+                        ui,
+                        "Top Albums",
+                        &self.listening_stats.top_albums,
+                        StatsMetric::Plays,
+                        self.listening_stats.top_albums.len() as u32,
+                        false,
+                    );
+                });
+            }
+        });
     }
 
     fn render_dashboard_header(&mut self, ui: &mut egui::Ui) {
@@ -1813,7 +1519,7 @@ impl OnyxApp {
         } else {
             let gap = 12.0;
             let card_width = (available - gap) / 2.0;
-            ui.horizontal(|ui| {
+            ui.horizontal_top(|ui| {
                 summary_card(
                     ui,
                     "Time listened",
@@ -2631,17 +2337,6 @@ impl OnyxApp {
         self.play_queue_index(next);
     }
 
-    fn play_previous(&mut self) {
-        if self.queue.is_empty() {
-            let _ = self.audio_cmd_tx.send(AudioCmd::Seek { position_ms: 0 });
-            self.update_position_immediately(0, true);
-            return;
-        }
-
-        let previous = self.queue_index.unwrap_or(0).saturating_sub(1);
-        self.play_queue_index(previous);
-    }
-
     fn advance_queue_after_track_end(&mut self, state: &PlaybackState) {
         if state.end_count == self.observed_end_count {
             return;
@@ -2674,18 +2369,6 @@ impl OnyxApp {
                 None
             };
             shared.is_playing = is_playing;
-        }
-    }
-
-    fn set_volume_immediately(&mut self, volume: u16, force_send: bool) {
-        if let Ok(mut shared) = self.playback_state.lock() {
-            shared.volume = volume;
-        }
-        if force_send || self.last_sent_volume.abs_diff(volume) > 384 {
-            self.last_sent_volume = volume;
-            let _ = self
-                .audio_cmd_tx
-                .send(AudioCmd::SetVolume { volume_u16: volume });
         }
     }
 }
@@ -2924,46 +2607,6 @@ fn lerp_color(from: egui::Color32, to: egui::Color32, t: f32) -> egui::Color32 {
     )
 }
 
-fn paint_volume_icon(ui: &egui::Ui, rect: egui::Rect, muted: bool, hovered: bool) {
-    let color = if hovered {
-        egui::Color32::WHITE
-    } else {
-        egui::Color32::from_rgb(179, 179, 179)
-    };
-    let c = rect.center() + egui::vec2(-2.0, 0.0);
-    let stroke = egui::Stroke::new(1.7, color);
-    let speaker = vec![
-        c + egui::vec2(-8.0, -3.5),
-        c + egui::vec2(-4.5, -3.5),
-        c + egui::vec2(0.5, -7.0),
-        c + egui::vec2(0.5, 7.0),
-        c + egui::vec2(-4.5, 3.5),
-        c + egui::vec2(-8.0, 3.5),
-    ];
-    ui.painter().add(egui::Shape::closed_line(speaker, stroke));
-
-    if muted {
-        let x_center = c + egui::vec2(8.2, 0.0);
-        ui.painter().line_segment(
-            [
-                x_center + egui::vec2(-3.0, -3.0),
-                x_center + egui::vec2(3.0, 3.0),
-            ],
-            stroke,
-        );
-        ui.painter().line_segment(
-            [
-                x_center + egui::vec2(3.0, -3.0),
-                x_center + egui::vec2(-3.0, 3.0),
-            ],
-            stroke,
-        );
-    } else {
-        paint_arc(ui, c + egui::vec2(2.5, 0.0), 5.0, -0.75, 0.75, stroke);
-        paint_arc(ui, c + egui::vec2(2.5, 0.0), 8.0, -0.65, 0.65, stroke);
-    }
-}
-
 fn paint_pin_indicator(ui: &egui::Ui, row_rect: egui::Rect) {
     const PIN_SVG: &[u8] = include_bytes!("../assets/fonts/pin.svg");
     const PIN_URI: &str = "bytes://onyx/pin.svg";
@@ -2991,23 +2634,6 @@ fn paint_pin_indicator(ui: &egui::Ui, row_rect: egui::Rect) {
             );
         }
     }
-}
-
-fn paint_arc(
-    ui: &egui::Ui,
-    center: egui::Pos2,
-    radius: f32,
-    start_angle: f32,
-    end_angle: f32,
-    stroke: egui::Stroke,
-) {
-    let mut points = Vec::new();
-    for step in 0..=12 {
-        let t = step as f32 / 12.0;
-        let angle = start_angle + (end_angle - start_angle) * t;
-        points.push(center + egui::vec2(angle.cos() * radius, angle.sin() * radius));
-    }
-    ui.painter().add(egui::Shape::line(points, stroke));
 }
 
 fn icon_button(ui: &mut egui::Ui, kind: IconKind, size: f32) -> egui::Response {
@@ -3266,26 +2892,34 @@ fn summary_card(ui: &mut egui::Ui, label: &str, value: &str, outer_width: f32) {
     const INNER_PAD: i8 = 18;
     let pad = f32::from(INNER_PAD);
     let inner_w = (outer_width - 2.0 * pad).max(1.0);
-    egui::Frame::default()
-        .fill(egui::Color32::from_rgb(31, 31, 31))
-        .corner_radius(10.0)
-        .inner_margin(egui::Margin::same(INNER_PAD))
-        .show(ui, |ui| {
-            ui.set_min_size(egui::vec2(inner_w, card_height));
-            ui.set_width(inner_w);
-            ui.label(
-                egui::RichText::new(label)
-                    .color(egui::Color32::from_rgb(179, 179, 179))
-                    .size(13.0),
-            );
-            ui.add_space(14.0);
-            ui.label(
-                egui::RichText::new(value)
-                    .color(egui::Color32::WHITE)
-                    .size(34.0)
-                    .strong(),
-            );
-        });
+    // Avoid inheriting horizontal layout when this card sits in `horizontal_top`.
+    ui.allocate_ui_with_layout(
+        egui::vec2(outer_width, 0.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_width(outer_width);
+            egui::Frame::default()
+                .fill(egui::Color32::from_rgb(31, 31, 31))
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::same(INNER_PAD))
+                .show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(inner_w, card_height));
+                    ui.set_width(inner_w);
+                    ui.label(
+                        egui::RichText::new(label)
+                            .color(egui::Color32::from_rgb(179, 179, 179))
+                            .size(13.0),
+                    );
+                    ui.add_space(14.0);
+                    ui.label(
+                        egui::RichText::new(value)
+                            .color(egui::Color32::WHITE)
+                            .size(34.0)
+                            .strong(),
+                    );
+                });
+        },
+    );
 }
 
 struct RankingResponse {
