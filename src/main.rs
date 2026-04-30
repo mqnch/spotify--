@@ -5,14 +5,15 @@ mod metadata;
 mod player;
 mod spotify_api;
 mod telemetry;
+mod gui;
 
 use anyhow::Result;
 use librespot::playback::player::PlayerEvent;
 use rspotify::prelude::*;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Initialize logger (set RUST_LOG=info or debug for more output).
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("onyx=info"),
@@ -23,38 +24,50 @@ async fn main() -> Result<()> {
     println!("  ╔═══════════════════════════╗");
     println!("  ║       ♫  O N Y X  ♫       ║");
     println!("  ╠═══════════════════════════╣");
-    println!("  ║  Minimalist Spotify Client ║");
+    println!("  ║ Minimalist Spotify Client ║");
     println!("  ╚═══════════════════════════╝");
 
-    // ── Step 1: Ensure API keys are configured ───────────────────────
-    let app_config = config::AppConfig::ensure_configured()?;
+    // Initialize tokio runtime
+    let rt = tokio::runtime::Runtime::new()?;
 
-    // ── Step 2: Authenticate with Spotify Web API (rspotify) ─────────
-    let spotify = auth::authenticate(&app_config).await?;
+    let (spotify, audio, db, playback_state) = rt.block_on(async {
+        // ── Step 1: Ensure API keys are configured ───────────────────────
+        let app_config = config::AppConfig::ensure_configured()?;
 
-    // Verify: print the authenticated user.
-    let user = spotify.current_user().await?;
-    println!(
-        "  Logged in as: {}",
-        user.display_name.as_deref().unwrap_or("(unknown)")
-    );
+        // ── Step 2: Authenticate with Spotify Web API (rspotify) ─────────
+        let spotify = auth::authenticate(&app_config).await?;
 
-    // ── Step 3: Start the audio engine (librespot) ───────────────────
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PlayerEvent>();
-    let audio = player::AudioEngine::start(event_tx).await?;
+        // Verify: print the authenticated user.
+        let user = spotify.current_user().await?;
+        println!(
+            "  Logged in as: {}",
+            user.display_name.as_deref().unwrap_or("(unknown)")
+        );
 
-    // ── Step 4: Event listener (Telemetry Engine) ────────────────────
-    let db = telemetry::TelemetryDb::new()?;
-    let spotify_clone = spotify.clone();
+        // ── Step 3: Start the audio engine (librespot) ───────────────────
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PlayerEvent>();
+        let audio = player::AudioEngine::start(event_tx).await?;
 
-    tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
+        // ── Step 4: Event listener (Telemetry Engine) ────────────────────
+        let db = Arc::new(Mutex::new(telemetry::TelemetryDb::new()?));
+        let playback_state = Arc::new(Mutex::new(gui::PlaybackState::default()));
+
+        let db_clone = Arc::clone(&db);
+        let state_clone = Arc::clone(&playback_state);
+        let spotify_clone = spotify.clone();
+
+        tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
             match &event {
                 PlayerEvent::Playing {
                     track_id,
                     position_ms,
                     ..
                 } => {
+                    if let Ok(mut st) = state_clone.lock() {
+                        st.is_playing = true;
+                        st.position_ms = *position_ms;
+                    }
                     log::info!("▶ Playing {:?} at {}ms", track_id, position_ms);
                 }
                 PlayerEvent::Paused {
@@ -62,6 +75,10 @@ async fn main() -> Result<()> {
                     position_ms,
                     ..
                 } => {
+                    if let Ok(mut st) = state_clone.lock() {
+                        st.is_playing = false;
+                        st.position_ms = *position_ms;
+                    }
                     log::info!("⏸ Paused {:?} at {}ms", track_id, position_ms);
                 }
                 PlayerEvent::EndOfTrack { track_id, .. } => {
@@ -80,10 +97,12 @@ async fn main() -> Result<()> {
                                     duration_ms: track_obj.duration.num_milliseconds() as u32,
                                     spotify_uri: track_obj.id.map(|id| id.uri()).unwrap_or_default(),
                                 };
-                                if let Err(e) = db.record_scrobble(&scrobble) {
-                                    log::error!("Failed to record scrobble: {}", e);
-                                } else {
-                                    log::info!("📝 Scrobbled: {} - {}", scrobble.artist_name, scrobble.track_name);
+                                if let Ok(db_lock) = db_clone.lock() {
+                                    if let Err(e) = db_lock.record_scrobble(&scrobble) {
+                                        log::error!("Failed to record scrobble: {}", e);
+                                    } else {
+                                        log::info!("📝 Scrobbled: {} - {}", scrobble.artist_name, scrobble.track_name);
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -93,14 +112,28 @@ async fn main() -> Result<()> {
                     }
                 }
                 PlayerEvent::VolumeChanged { volume } => {
+                    if let Ok(mut st) = state_clone.lock() {
+                        st.volume = *volume;
+                    }
                     log::info!("🔊 Volume → {}", volume);
                 }
                 PlayerEvent::TrackChanged { audio_item } => {
+                    if let Ok(mut st) = state_clone.lock() {
+                        st.track_name = audio_item.name.clone();
+                    }
                     log::info!(
                         "🎵 Track changed → {} - {}",
                         audio_item.track_id,
                         audio_item.name
                     );
+                }
+                PlayerEvent::Stopped { .. } => {
+                    if let Ok(mut st) = state_clone.lock() {
+                        st.is_playing = false;
+                        st.track_name.clear();
+                        st.artist_name.clear();
+                    }
+                    log::info!("⏹ Stopped");
                 }
                 _ => {
                     log::debug!("Player event: {:?}", event);
@@ -109,11 +142,31 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ── Step 5: Demo — Hybrid Metadata Pipeline ──────────────────────
-    demo_metadata_pipeline(&app_config, &spotify, &audio).await?;
+    // // ── Step 5: Demo — Hybrid Metadata Pipeline ──────────────────────
+    // demo_metadata_pipeline(&app_config, &spotify, &audio).await?;
 
-    // Keep the process alive until Ctrl+C.
-    tokio::signal::ctrl_c().await?;
+        Ok::<(rspotify::AuthCodeSpotify, player::AudioHandle, Arc<Mutex<telemetry::TelemetryDb>>, Arc<Mutex<gui::PlaybackState>>), anyhow::Error>((spotify, audio, db, playback_state))
+    })?;
+
+    let audio_cmd_tx = audio.cmd_tx.clone();
+
+    // ── Step 6: GUI Construction (egui) ─────────────────────────────
+    let native_options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 800.0])
+            .with_min_inner_size([800.0, 600.0])
+            .with_title_shown(false)
+            .with_titlebar_shown(false)
+            .with_titlebar_buttons_shown(false)
+            .with_fullsize_content_view(true),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Onyx",
+        native_options,
+        Box::new(move |cc| Ok(Box::new(gui::OnyxApp::new(cc, spotify.clone(), audio_cmd_tx, playback_state.clone(), db.clone())))),
+    )
+    .map_err(|e| anyhow::anyhow!("eframe error: {}", e))?;
 
     audio.cmd_tx.send(player::AudioCmd::Shutdown)?;
     println!("\n  Goodbye.");
