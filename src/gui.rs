@@ -10,7 +10,7 @@ use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct PlaybackState {
     pub is_playing: bool,
     pub track_name: String,
@@ -23,6 +23,24 @@ pub struct PlaybackState {
     pub duration_ms: u32,
     pub volume: u16,
     pub end_count: u64,
+}
+
+impl Default for PlaybackState {
+    fn default() -> Self {
+        Self {
+            is_playing: false,
+            track_name: String::new(),
+            artist_name: String::new(),
+            artwork_url: None,
+            spotify_uri: None,
+            position_ms: 0,
+            position_anchor_ms: 0,
+            position_updated_at: None,
+            duration_ms: 0,
+            volume: u16::MAX,
+            end_count: 0,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -172,6 +190,7 @@ pub struct OnyxApp {
     last_queue_load_at: Option<Instant>,
     observed_end_count: u64,
     last_sent_volume: u16,
+    previous_volume: u16,
 
     // Playback state toggles
     shuffle: bool,
@@ -195,7 +214,7 @@ impl OnyxApp {
         visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::from_rgb(179, 179, 179); // Gray text
         visuals.selection.bg_fill = egui::Color32::from_rgb(30, 215, 96); // Spotify Green
         cc.egui_ctx.set_visuals(visuals);
-        install_system_font(&cc.egui_ctx);
+        install_manrope_font(&cc.egui_ctx);
 
         let (top_artists, top_tracks) = {
             if let Ok(db_lock) = db.lock() {
@@ -309,7 +328,8 @@ impl OnyxApp {
             pending_queue_index: None,
             last_queue_load_at: None,
             observed_end_count: 0,
-            last_sent_volume: 0,
+            last_sent_volume: u16::MAX,
+            previous_volume: u16::MAX,
             shuffle: false,
             repeat: false,
         }
@@ -342,8 +362,8 @@ impl OnyxApp {
                 && !cached.tracks.is_empty()
                 && (cache_only
                     || cached.snapshot_id.is_some()
-                    && playlist.snapshot_id.is_some()
-                    && cached.snapshot_id == playlist.snapshot_id
+                        && playlist.snapshot_id.is_some()
+                        && cached.snapshot_id == playlist.snapshot_id
                     || crate::playlist_cache::PlaylistCache::cache_is_fresh(cached.fetched_at))
         });
 
@@ -356,7 +376,9 @@ impl OnyxApp {
                 .unwrap_or_default();
             state.complete = cached_tracks.as_ref().is_some_and(|cached| cached.complete);
             state.status = if cache_only && state.tracks.is_empty() {
-                PlaylistStatus::Error("Cache-only mode: no cached tracks for this playlist.".to_string())
+                PlaylistStatus::Error(
+                    "Cache-only mode: no cached tracks for this playlist.".to_string(),
+                )
             } else if state.tracks.is_empty() {
                 PlaylistStatus::Loading
             } else if cache_only || can_use_cache_without_refresh {
@@ -789,15 +811,10 @@ impl eframe::App for OnyxApp {
                                 let new_vol = (vol_pct * 65535.0) as u16;
                                 if new_vol != state.volume {
                                     state.volume = new_vol;
-                                    if let Ok(mut shared) = self.playback_state.lock() {
-                                        shared.volume = new_vol;
+                                    if new_vol > 0 {
+                                        self.previous_volume = new_vol;
                                     }
-                                    if self.last_sent_volume.abs_diff(new_vol) > 384 {
-                                        self.last_sent_volume = new_vol;
-                                        let _ = self.audio_cmd_tx.send(AudioCmd::SetVolume {
-                                            volume_u16: new_vol,
-                                        });
-                                    }
+                                    self.set_volume_immediately(new_vol, true);
                                 }
                             }
                         }
@@ -809,45 +826,21 @@ impl eframe::App for OnyxApp {
                         ui.painter()
                             .rect_filled(filled_rect, 2.0, egui::Color32::WHITE);
 
-                        // Volume Icon
                         let (rect, resp) =
                             ui.allocate_exact_size(egui::vec2(btn_w, btn_w), egui::Sense::click());
-                        let color = if resp.hovered() {
-                            egui::Color32::WHITE
-                        } else {
-                            egui::Color32::from_rgb(179, 179, 179)
-                        };
-                        let c = rect.center() + egui::vec2(-2.0, 0.0);
-                        let stroke = (1.5, color);
-                        ui.painter().rect_stroke(
-                            egui::Rect::from_center_size(
-                                c - egui::vec2(2.0, 0.0),
-                                egui::vec2(3.0, 6.0),
-                            ),
-                            0.0,
-                            stroke,
-                            egui::StrokeKind::Middle,
-                        );
-                        ui.painter().line_segment(
-                            [c - egui::vec2(0.5, 3.0), c + egui::vec2(3.5, -6.0)],
-                            stroke,
-                        );
-                        ui.painter().line_segment(
-                            [c + egui::vec2(3.5, -6.0), c + egui::vec2(3.5, 6.0)],
-                            stroke,
-                        );
-                        ui.painter().line_segment(
-                            [c + egui::vec2(3.5, 6.0), c - egui::vec2(0.5, 3.0)],
-                            stroke,
-                        );
-                        ui.painter().line_segment(
-                            [c + egui::vec2(6.5, -3.0), c + egui::vec2(6.5, 3.0)],
-                            stroke,
-                        );
-                        ui.painter().line_segment(
-                            [c + egui::vec2(9.5, -5.0), c + egui::vec2(9.5, 5.0)],
-                            stroke,
-                        );
+                        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if resp.clicked() {
+                            if state.volume == 0 {
+                                let restore = self.previous_volume.max(1);
+                                state.volume = restore;
+                                self.set_volume_immediately(restore, true);
+                            } else {
+                                self.previous_volume = state.volume;
+                                state.volume = 0;
+                                self.set_volume_immediately(0, true);
+                            }
+                        }
+                        paint_volume_icon(ui, rect, state.volume == 0, resp.hovered());
 
                         // Device Icon
                         let (rect, resp) =
@@ -1235,6 +1228,7 @@ impl OnyxApp {
         ui.add_space(24.0);
         let playlist_is_playing = self.playlist_is_current(playlist) && playback_state.is_playing;
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 14.0;
             if play_pause_button(
                 ui,
                 48.0,
@@ -1355,7 +1349,11 @@ impl OnyxApp {
         let is_current = self.track_is_current(track, playback_state);
         let muted = egui::Color32::from_rgb(179, 179, 179);
         let green = egui::Color32::from_rgb(30, 215, 96);
-        let title_color = if is_current { green } else { egui::Color32::WHITE };
+        let title_color = if is_current {
+            green
+        } else {
+            egui::Color32::WHITE
+        };
         let index_color = if is_current { green } else { muted };
 
         paint_left_text(
@@ -1369,7 +1367,10 @@ impl OnyxApp {
 
         let image_size = 36.0;
         let image_rect = egui::Rect::from_min_size(
-            egui::pos2(columns.title.left(), columns.title.center().y - image_size / 2.0),
+            egui::pos2(
+                columns.title.left(),
+                columns.title.center().y - image_size / 2.0,
+            ),
             egui::vec2(image_size, image_size),
         );
         if let Some(url) = track
@@ -1411,7 +1412,13 @@ impl OnyxApp {
             13.0,
             false,
         );
-        paint_right_text(ui, columns.duration, &format_duration(track.duration_ms), muted, 13.0);
+        paint_right_text(
+            ui,
+            columns.duration,
+            &format_duration(track.duration_ms),
+            muted,
+            13.0,
+        );
     }
 
     fn render_dashboard_view(&self, ui: &mut egui::Ui) {
@@ -1527,7 +1534,9 @@ impl OnyxApp {
             .send(AudioCmd::SetEqualizer(self.user_settings.equalizer.clone()));
         match self.user_settings.save() {
             Ok(()) => self.settings_status = Some("Equalizer settings saved.".to_string()),
-            Err(e) => self.settings_status = Some(format!("Failed to save equalizer settings: {}", e)),
+            Err(e) => {
+                self.settings_status = Some(format!("Failed to save equalizer settings: {}", e))
+            }
         }
     }
 
@@ -1611,7 +1620,10 @@ impl OnyxApp {
         for idx in 0..EQ_BANDS.len() {
             let x = band_x(graph_rect, idx);
             ui.painter().line_segment(
-                [egui::pos2(x, graph_rect.top()), egui::pos2(x, graph_rect.bottom())],
+                [
+                    egui::pos2(x, graph_rect.top()),
+                    egui::pos2(x, graph_rect.bottom()),
+                ],
                 egui::Stroke::new(1.0, grid),
             );
         }
@@ -1630,17 +1642,24 @@ impl OnyxApp {
             .bands_db
             .iter()
             .enumerate()
-            .map(|(idx, gain)| egui::pos2(band_x(graph_rect, idx), db_to_graph_y(graph_rect, *gain)))
+            .map(|(idx, gain)| {
+                egui::pos2(band_x(graph_rect, idx), db_to_graph_y(graph_rect, *gain))
+            })
             .collect();
-        let mut fill_points = Vec::with_capacity(points.len() + 2);
-        fill_points.push(egui::pos2(graph_rect.left(), graph_rect.bottom()));
-        fill_points.extend(points.iter().copied());
-        fill_points.push(egui::pos2(graph_rect.right(), graph_rect.bottom()));
-        ui.painter().add(egui::Shape::convex_polygon(
-            fill_points,
-            egui::Color32::from_rgba_unmultiplied(30, 215, 96, 70),
-            egui::Stroke::NONE,
-        ));
+        for pair in points.windows(2) {
+            let left = pair[0];
+            let right = pair[1];
+            ui.painter().add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(left.x, graph_rect.bottom()),
+                    left,
+                    right,
+                    egui::pos2(right.x, graph_rect.bottom()),
+                ],
+                egui::Color32::from_rgba_unmultiplied(30, 215, 96, 70),
+                egui::Stroke::NONE,
+            ));
+        }
 
         ui.painter().add(egui::Shape::line(
             points.clone(),
@@ -1649,15 +1668,21 @@ impl OnyxApp {
 
         for (idx, point) in points.iter().enumerate() {
             let hit_rect = egui::Rect::from_center_size(*point, egui::vec2(22.0, 22.0));
-            let response = ui.interact(hit_rect, ui.id().with(("eq_band", idx)), egui::Sense::drag());
+            let response = ui.interact(
+                hit_rect,
+                ui.id().with(("eq_band", idx)),
+                egui::Sense::drag(),
+            );
             if response.dragged() {
                 if let Some(pointer) = response.interact_pointer_pos() {
+                    let clamped_y = pointer.y.clamp(graph_rect.top(), graph_rect.bottom());
                     self.user_settings.equalizer.bands_db[idx] =
-                        graph_y_to_db(graph_rect, pointer.y).clamp(-12.0, 12.0);
+                        graph_y_to_db(graph_rect, clamped_y).clamp(-12.0, 12.0);
                     changed = true;
                 }
             }
-            ui.painter().circle_filled(*point, 4.0, egui::Color32::WHITE);
+            ui.painter()
+                .circle_filled(*point, 4.0, egui::Color32::WHITE);
         }
 
         for (idx, band) in EQ_BANDS.iter().enumerate() {
@@ -1676,16 +1701,15 @@ impl OnyxApp {
         );
         ui.scope_builder(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Preamp")
-                        .color(label_color)
-                        .size(12.0),
-                );
+                ui.label(egui::RichText::new("Preamp").color(label_color).size(12.0));
                 changed |= ui
                     .add(
-                        egui::Slider::new(&mut self.user_settings.equalizer.preamp_db, -12.0..=12.0)
-                            .show_value(true)
-                            .suffix(" dB"),
+                        egui::Slider::new(
+                            &mut self.user_settings.equalizer.preamp_db,
+                            -12.0..=12.0,
+                        )
+                        .show_value(true)
+                        .suffix(" dB"),
                     )
                     .changed();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1945,6 +1969,18 @@ impl OnyxApp {
             shared.is_playing = is_playing;
         }
     }
+
+    fn set_volume_immediately(&mut self, volume: u16, force_send: bool) {
+        if let Ok(mut shared) = self.playback_state.lock() {
+            shared.volume = volume;
+        }
+        if force_send || self.last_sent_volume.abs_diff(volume) > 384 {
+            self.last_sent_volume = volume;
+            let _ = self
+                .audio_cmd_tx
+                .send(AudioCmd::SetVolume { volume_u16: volume });
+        }
+    }
 }
 
 fn settings_text_field(ui: &mut egui::Ui, label: &str, value: &mut String, password: bool) {
@@ -2045,12 +2081,12 @@ fn play_pause_button(
         }
     } else {
         let center = rect.center() + egui::vec2(size * 0.035, 0.0);
-        let h = size * 0.44;
-        let w = size * 0.36;
+        let h = size * 0.42;
+        let w = size * 0.34;
         ui.painter().add(egui::Shape::convex_polygon(
             vec![
-                center + egui::vec2(-w * 0.42, -h * 0.5),
-                center + egui::vec2(-w * 0.42, h * 0.5),
+                center + egui::vec2(-w * 0.45, -h * 0.5),
+                center + egui::vec2(-w * 0.45, h * 0.5),
                 center + egui::vec2(w * 0.58, 0.0),
             ],
             icon_color,
@@ -2069,6 +2105,63 @@ fn lighten(color: egui::Color32, amount: u8) -> egui::Color32 {
     )
 }
 
+fn paint_volume_icon(ui: &egui::Ui, rect: egui::Rect, muted: bool, hovered: bool) {
+    let color = if hovered {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_rgb(179, 179, 179)
+    };
+    let c = rect.center() + egui::vec2(-2.0, 0.0);
+    let stroke = egui::Stroke::new(1.7, color);
+    let speaker = vec![
+        c + egui::vec2(-8.0, -3.5),
+        c + egui::vec2(-4.5, -3.5),
+        c + egui::vec2(0.5, -7.0),
+        c + egui::vec2(0.5, 7.0),
+        c + egui::vec2(-4.5, 3.5),
+        c + egui::vec2(-8.0, 3.5),
+    ];
+    ui.painter().add(egui::Shape::closed_line(speaker, stroke));
+
+    if muted {
+        let x_center = c + egui::vec2(8.2, 0.0);
+        ui.painter().line_segment(
+            [
+                x_center + egui::vec2(-3.0, -3.0),
+                x_center + egui::vec2(3.0, 3.0),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                x_center + egui::vec2(3.0, -3.0),
+                x_center + egui::vec2(-3.0, 3.0),
+            ],
+            stroke,
+        );
+    } else {
+        paint_arc(ui, c + egui::vec2(2.5, 0.0), 5.0, -0.75, 0.75, stroke);
+        paint_arc(ui, c + egui::vec2(2.5, 0.0), 8.0, -0.65, 0.65, stroke);
+    }
+}
+
+fn paint_arc(
+    ui: &egui::Ui,
+    center: egui::Pos2,
+    radius: f32,
+    start_angle: f32,
+    end_angle: f32,
+    stroke: egui::Stroke,
+) {
+    let mut points = Vec::new();
+    for step in 0..=12 {
+        let t = step as f32 / 12.0;
+        let angle = start_angle + (end_angle - start_angle) * t;
+        points.push(center + egui::vec2(angle.cos() * radius, angle.sin() * radius));
+    }
+    ui.painter().add(egui::Shape::line(points, stroke));
+}
+
 fn icon_button(ui: &mut egui::Ui, kind: IconKind, size: f32) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -2080,8 +2173,11 @@ fn icon_button(ui: &mut egui::Ui, kind: IconKind, size: f32) -> egui::Response {
     };
 
     if hovered {
-        ui.painter()
-            .circle_filled(rect.center(), size * 0.48, egui::Color32::from_rgb(32, 32, 32));
+        ui.painter().circle_filled(
+            rect.center(),
+            size * 0.48,
+            egui::Color32::from_rgb(32, 32, 32),
+        );
     }
 
     match kind {
@@ -2107,24 +2203,26 @@ fn paint_home_icon(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
 
     ui.painter().line_segment([left_roof, roof_top], stroke);
     ui.painter().line_segment([roof_top, right_roof], stroke);
-    ui.painter().line_segment([body_left, body_bottom_left], stroke);
-    ui.painter().line_segment([body_right, body_bottom_right], stroke);
+    ui.painter()
+        .line_segment([body_left, body_bottom_left], stroke);
+    ui.painter()
+        .line_segment([body_right, body_bottom_right], stroke);
     ui.painter()
         .line_segment([body_bottom_left, body_bottom_right], stroke);
 }
 
 fn paint_settings_icon(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
     let c = rect.center();
-    let stroke = egui::Stroke::new(1.5, color);
-    let r = rect.width() * 0.19;
+    let stroke = egui::Stroke::new(1.55, color);
+    let r = rect.width() * 0.2;
     ui.painter().circle_stroke(c, r, stroke);
-    ui.painter().circle_stroke(c, r * 0.38, stroke);
+    ui.painter().circle_stroke(c, r * 0.42, stroke);
 
     for i in 0..8 {
         let angle = i as f32 * std::f32::consts::TAU / 8.0;
         let dir = egui::vec2(angle.cos(), angle.sin());
         ui.painter()
-            .line_segment([c + dir * (r * 1.25), c + dir * (r * 1.75)], stroke);
+            .line_segment([c + dir * (r * 1.18), c + dir * (r * 1.55)], stroke);
     }
 }
 
@@ -2165,7 +2263,9 @@ fn paint_left_text(
     let text = elide_to_width(text, rect.width(), size);
     let font_id = egui::FontId::proportional(size);
     let pos = egui::pos2(rect.left(), rect.center().y - size * 0.55);
-    let galley = ui.painter().layout_no_wrap(text.clone(), font_id.clone(), color);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.clone(), font_id.clone(), color);
     ui.painter().galley(pos, galley, color);
     if strong {
         let strong_galley = ui.painter().layout_no_wrap(text, font_id, color);
@@ -2178,7 +2278,10 @@ fn paint_right_text(ui: &egui::Ui, rect: egui::Rect, text: &str, color: egui::Co
     let text = elide_to_width(text, rect.width(), size);
     let font_id = egui::FontId::proportional(size);
     let galley = ui.painter().layout_no_wrap(text, font_id, color);
-    let pos = egui::pos2(rect.right() - galley.size().x, rect.center().y - size * 0.55);
+    let pos = egui::pos2(
+        rect.right() - galley.size().x,
+        rect.center().y - size * 0.55,
+    );
     ui.painter().galley(pos, galley, color);
 }
 
@@ -2210,22 +2313,49 @@ fn shuffle_tracks(tracks: &mut [PlaylistTrack]) {
     }
 }
 
-fn install_system_font(ctx: &egui::Context) {
-    let candidates = [
-        "/System/Library/Fonts/SFNS.ttf",
-        "/System/Library/Fonts/SFNSDisplay.ttf",
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-    ];
+fn install_manrope_font(ctx: &egui::Context) {
+    let manrope_font_files = ["Manrope.ttf", "Manrope-Regular.ttf", "Manrope-Medium.ttf"];
+    let app_font_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("fonts");
+    let mut candidates: Vec<String> = manrope_font_files
+        .iter()
+        .map(|file| app_font_dir.join(file).display().to_string())
+        .collect();
+    candidates.extend(manrope_font_files.iter().flat_map(|file| {
+        [
+            format!("/Library/Fonts/{}", file),
+            format!("/System/Library/Fonts/{}", file),
+        ]
+    }));
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::PathBuf::from(home);
+        candidates.extend(manrope_font_files.iter().map(|file| {
+            home.join("Library")
+                .join("Fonts")
+                .join(file)
+                .display()
+                .to_string()
+        }));
+    }
+    candidates.extend(
+        [
+            "/System/Library/Fonts/SFNS.ttf",
+            "/System/Library/Fonts/SFNSDisplay.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ]
+        .iter()
+        .map(|path| (*path).to_string()),
+    );
 
-    let Some((font_name, font_data)) = candidates.iter().find_map(|path| {
-        std::fs::read(path)
-            .ok()
-            .map(|bytes| ((*path).to_string(), bytes))
-    }) else {
+    let mut fonts = egui::FontDefinitions::default();
+    let Some((font_name, font_data)) = candidates
+        .iter()
+        .find_map(|path| std::fs::read(path).ok().map(|bytes| (path.clone(), bytes)))
+    else {
         return;
     };
 
-    let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         font_name.clone(),
         egui::FontData::from_owned(font_data).into(),
