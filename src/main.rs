@@ -161,10 +161,11 @@ fn main() -> Result<()> {
             .with_fullsize_content_view(true),
         ..Default::default()
     };
+    let rt_handle = rt.handle().clone();
     eframe::run_native(
         "Onyx",
         native_options,
-        Box::new(move |cc| Ok(Box::new(gui::OnyxApp::new(cc, spotify.clone(), audio_cmd_tx, playback_state.clone(), db.clone())))),
+        Box::new(move |cc| Ok(Box::new(gui::OnyxApp::new(cc, rt_handle, spotify.clone(), audio_cmd_tx, playback_state.clone(), db.clone())))),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {}", e))?;
 

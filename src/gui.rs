@@ -22,11 +22,23 @@ pub struct OnyxApp {
     
     top_artists: Vec<crate::telemetry::TopItem>,
     top_tracks: Vec<crate::telemetry::TopItem>,
+
+    // Phase 5 Additions
+    pub rt: tokio::runtime::Handle,
+    playlists: Arc<Mutex<Vec<crate::spotify_api::PlaylistSummary>>>,
+    selected_playlist_id: Option<String>,
+    selected_playlist_name: Option<String>,
+    playlist_tracks: Arc<Mutex<Option<Vec<crate::spotify_api::PlaylistTrack>>>>,
+
+    // Playback state toggles
+    shuffle: bool,
+    repeat: bool,
 }
 
 impl OnyxApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
+        rt: tokio::runtime::Handle,
         spotify: AuthCodeSpotify,
         audio_cmd_tx: UnboundedSender<AudioCmd>,
         playback_state: Arc<Mutex<PlaybackState>>,
@@ -50,6 +62,22 @@ impl OnyxApp {
             }
         };
 
+        let playlists = Arc::new(Mutex::new(Vec::new()));
+        let playlists_clone = playlists.clone();
+        let spotify_clone = spotify.clone();
+        let ctx_clone = cc.egui_ctx.clone();
+        
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+        
+        rt.spawn(async move {
+            if let Ok(pl) = crate::spotify_api::user_playlists(&spotify_clone).await {
+                if let Ok(mut lock) = playlists_clone.lock() {
+                    *lock = pl;
+                }
+                ctx_clone.request_repaint();
+            }
+        });
+
         Self {
             spotify,
             audio_cmd_tx,
@@ -57,6 +85,13 @@ impl OnyxApp {
             db,
             top_artists,
             top_tracks,
+            rt,
+            playlists,
+            selected_playlist_id: None,
+            selected_playlist_name: None,
+            playlist_tracks: Arc::new(Mutex::new(None)),
+            shuffle: false,
+            repeat: false,
         }
     }
 }
@@ -127,8 +162,14 @@ impl eframe::App for OnyxApp {
                                 ui.add_space(center_space);
                                 ui.spacing_mut().item_spacing.x = spacing;
                                 
-                                let _ = ui.add_sized([btn_w, btn_w], egui::Button::new(egui::RichText::new("🔀").size(16.0)).frame(false));
-                                let _ = ui.add_sized([btn_w, btn_w], egui::Button::new(egui::RichText::new("⏮").size(16.0)).frame(false));
+                                let shuffle_color = if self.shuffle { egui::Color32::from_rgb(30, 215, 96) } else { egui::Color32::from_rgb(179, 179, 179) };
+                                if ui.add_sized([btn_w, btn_w], egui::Button::new(egui::RichText::new("🔀").size(16.0).color(shuffle_color)).frame(false)).clicked() {
+                                    self.shuffle = !self.shuffle;
+                                }
+                                if ui.add_sized([btn_w, btn_w], egui::Button::new(egui::RichText::new("⏮").size(16.0)).frame(false)).clicked() {
+                                    // Normally we would send AudioCmd::Previous
+                                    let _ = self.audio_cmd_tx.send(AudioCmd::Seek { position_ms: 0 });
+                                }
                                 
                                 let play_icon = if state.is_playing { "⏸" } else { "▶" };
                                 let play_btn = egui::Button::new(egui::RichText::new(play_icon).size(18.0).color(egui::Color32::BLACK))
@@ -143,8 +184,13 @@ impl eframe::App for OnyxApp {
                                     }
                                 }
                                 
-                                let _ = ui.add_sized([btn_w, btn_w], egui::Button::new(egui::RichText::new("⏭").size(16.0)).frame(false));
-                                let _ = ui.add_sized([btn_w, btn_w], egui::Button::new(egui::RichText::new("🔁").size(16.0)).frame(false));
+                                if ui.add_sized([btn_w, btn_w], egui::Button::new(egui::RichText::new("⏭").size(16.0)).frame(false)).clicked() {
+                                    // Send next command when implemented
+                                }
+                                let repeat_color = if self.repeat { egui::Color32::from_rgb(30, 215, 96) } else { egui::Color32::from_rgb(179, 179, 179) };
+                                if ui.add_sized([btn_w, btn_w], egui::Button::new(egui::RichText::new("🔁").size(16.0).color(repeat_color)).frame(false)).clicked() {
+                                    self.repeat = !self.repeat;
+                                }
                             }
                         );
                         
@@ -168,13 +214,22 @@ impl eframe::App for OnyxApp {
                                 
                                 ui.spacing_mut().item_spacing.x = 8.0;
                                 
-                                // Custom thin progress bar
-                                let (rect, _resp) = ui.allocate_exact_size(egui::vec2(pb_width, 4.0), egui::Sense::hover());
+                                let (rect, resp) = ui.allocate_exact_size(egui::vec2(pb_width, 4.0), egui::Sense::click_and_drag());
+                                if resp.clicked() || resp.dragged() {
+                                    if let Some(pos) = resp.interact_pointer_pos() {
+                                        let x = (pos.x - rect.left()).clamp(0.0, pb_width);
+                                        let pct = x / pb_width;
+                                        // Fake duration of 3 mins for demo if not provided
+                                        let duration = 3.0 * 60.0 * 1000.0;
+                                        let new_pos = (pct * duration) as u32;
+                                        let _ = self.audio_cmd_tx.send(AudioCmd::Seek { position_ms: new_pos });
+                                    }
+                                }
                                 ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(83, 83, 83));
                                 let mut filled_rect = rect;
-                                // In a real app, this would be a percentage based on track length:
-                                // let pct = (state.position_ms as f32 / duration).clamp(0.0, 1.0);
-                                filled_rect.set_width(0.0); 
+                                // Fake duration
+                                let pct = (state.position_ms as f32 / (3.0 * 60.0 * 1000.0)).clamp(0.0, 1.0);
+                                filled_rect.set_width(pb_width * pct); 
                                 ui.painter().rect_filled(filled_rect, 2.0, egui::Color32::WHITE);
                                 
                                 ui.add_sized([time_w, 12.0], egui::Label::new(egui::RichText::new("-:--").size(11.0).color(egui::Color32::from_rgb(179, 179, 179))));
@@ -260,7 +315,7 @@ impl eframe::App for OnyxApp {
         // SIDEBAR (#000000)
         let mut side_frame = egui::Frame::default();
         side_frame.fill = egui::Color32::from_rgb(0, 0, 0);
-        side_frame.inner_margin = egui::Margin::same(16);
+        side_frame.inner_margin = egui::Margin { left: 16, right: 0, top: 16, bottom: 16 };
         
         egui::SidePanel::left("sidebar")
             .resizable(true)
@@ -301,11 +356,12 @@ impl eframe::App for OnyxApp {
                     }
                     if max_resp.clicked() { ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true)); }
                 });
-                ui.add_space(24.0);
+                ui.add_space(12.0);
                 
                 ui.horizontal(|ui| {
                     ui.heading(egui::RichText::new("Your Library").color(egui::Color32::from_rgb(179, 179, 179)).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(16.0);
                         let _ = ui.add(egui::Button::new(egui::RichText::new("→").size(16.0)).frame(false));
                         let _ = ui.add(egui::Button::new(egui::RichText::new("+").size(16.0)).frame(false));
                     });
@@ -317,6 +373,7 @@ impl eframe::App for OnyxApp {
                 ui.horizontal(|ui| {
                     let _ = ui.add(egui::Button::new(egui::RichText::new("🔍").size(14.0)).frame(false));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(16.0); // Prevent touching the split line
                         ui.label(egui::RichText::new("Recents ☰").size(12.0));
                     });
                 });
@@ -325,18 +382,75 @@ impl eframe::App for OnyxApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
-                        for i in 1..=20 {
-                            ui.horizontal(|ui| {
-                                let (rect, _) = ui.allocate_exact_size(egui::vec2(48.0, 48.0), egui::Sense::hover());
-                                ui.painter().rect_filled(rect, 4.0, egui::Color32::from_rgb(40, 40, 40));
+                        let playlists = {
+                            self.playlists.lock().unwrap().clone()
+                        };
+                        for p in playlists {
+                            let is_selected = self.selected_playlist_id.as_ref() == Some(&p.id);
+                            
+                            let mut frame = egui::Frame::default().inner_margin(4.0);
+                            if is_selected {
+                                frame.fill = egui::Color32::from_rgb(40, 40, 40);
+                                frame = frame.corner_radius(4);
+                            }
+                            
+                            frame.show(ui, |ui| {
+                                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 48.0), egui::Sense::click());
                                 
-                                ui.vertical(|ui| {
-                                    ui.add_space(6.0);
-                                    ui.label(egui::RichText::new(format!("Playlist {}", i)).color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Playlist • felix").color(egui::Color32::from_rgb(179, 179, 179)).size(12.0));
+                                if resp.clicked() {
+                                    if self.selected_playlist_id.as_ref() != Some(&p.id) {
+                                        self.selected_playlist_id = Some(p.id.clone());
+                                        self.selected_playlist_name = Some(p.name.clone());
+                                        let tracks_clone = self.playlist_tracks.clone();
+                                        
+                                        // Clear current tracks while loading
+                                        if let Ok(mut lock) = tracks_clone.lock() {
+                                            *lock = None;
+                                        }
+
+                                        let spotify_clone = self.spotify.clone();
+                                        let pid = p.id.clone();
+                                        let ctx_clone = ctx.clone();
+                                        self.rt.spawn(async move {
+                                            log::info!("Fetching tracks for playlist ID: '{}'", pid);
+                                            match crate::spotify_api::playlist_tracks(&spotify_clone, &pid).await {
+                                                Ok(tracks) => {
+                                                    log::info!("Successfully fetched {} tracks", tracks.len());
+                                                    if let Ok(mut lock) = tracks_clone.lock() {
+                                                        *lock = Some(tracks);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    log::error!("Failed to fetch playlist tracks: {:?}", e);
+                                                    if let Ok(mut lock) = tracks_clone.lock() {
+                                                        *lock = Some(vec![]); // clear loading
+                                                    }
+                                                }
+                                            }
+                                            ctx_clone.request_repaint();
+                                        });
+                                    }
+                                }
+
+                                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                        if let Some(url) = &p.image_url {
+                                            ui.add(egui::Image::new(url).corner_radius(4_u8).fit_to_exact_size(egui::vec2(48.0, 48.0)));
+                                        } else {
+                                            let (img_rect, _) = ui.allocate_exact_size(egui::vec2(48.0, 48.0), egui::Sense::hover());
+                                            ui.painter().rect_filled(img_rect, 4.0, egui::Color32::from_rgb(40, 40, 40));
+                                        }
+                                        
+                                        ui.vertical(|ui| {
+                                            ui.add_space(6.0);
+                                            let color = if is_selected { egui::Color32::from_rgb(30, 215, 96) } else { egui::Color32::WHITE };
+                                            ui.label(egui::RichText::new(&p.name).color(color).strong());
+                                            ui.label(egui::RichText::new(format!("Playlist • {} tracks", p.track_count)).color(egui::Color32::from_rgb(179, 179, 179)).size(12.0));
+                                        });
+                                    });
                                 });
                             });
-                            ui.add_space(4.0);
+                            ui.add_space(2.0);
                         }
                     });
             });
@@ -348,22 +462,59 @@ impl eframe::App for OnyxApp {
         
         egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
             egui::ScrollArea::both().show(ui, |ui| {
-                ui.heading(egui::RichText::new("Dashboard").color(egui::Color32::WHITE).size(24.0).strong());
-                ui.add_space(16.0);
-    
-                ui.columns(2, |columns| {
-                    columns[0].heading(egui::RichText::new("Top Tracks").color(egui::Color32::WHITE));
-                    columns[0].add_space(8.0);
-                    for track in &self.top_tracks {
-                        columns[0].label(egui::RichText::new(format!("{} ({} plays)", track.name, track.count)).color(egui::Color32::from_rgb(179, 179, 179)));
+                if let Some(pid) = &self.selected_playlist_id {
+                    let name = self.selected_playlist_name.as_deref().unwrap_or("Playlist");
+                    ui.heading(egui::RichText::new(name).color(egui::Color32::WHITE).size(32.0).strong());
+                    ui.add_space(16.0);
+                    
+                    let tracks_opt = self.playlist_tracks.lock().unwrap().clone();
+                    if let Some(tracks) = tracks_opt {
+                        for (i, track) in tracks.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.add_sized([24.0, 16.0], egui::Label::new(egui::RichText::new(format!("{}", i + 1)).color(egui::Color32::from_rgb(179, 179, 179))));
+                                
+                                let resp = ui.allocate_rect(egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), 40.0)), egui::Sense::click());
+                                if resp.clicked() {
+                                    let _ = self.audio_cmd_tx.send(AudioCmd::Load {
+                                        uri: track.spotify_uri.clone(),
+                                        start_playing: true,
+                                        position_ms: 0,
+                                    });
+                                }
+                                if resp.hovered() {
+                                    ui.painter().rect_filled(resp.rect, 4.0, egui::Color32::from_rgb(40, 40, 40));
+                                }
+
+                                ui.vertical(|ui| {
+                                    ui.add_space(2.0);
+                                    let color = if state.track_name == track.name { egui::Color32::from_rgb(30, 215, 96) } else { egui::Color32::WHITE };
+                                    ui.label(egui::RichText::new(&track.name).color(color).strong());
+                                    ui.label(egui::RichText::new(&track.artist).color(egui::Color32::from_rgb(179, 179, 179)).size(12.0));
+                                });
+                            });
+                            ui.add_space(4.0);
+                        }
+                    } else {
+                        ui.label(egui::RichText::new("Loading tracks...").color(egui::Color32::from_rgb(179, 179, 179)));
                     }
-    
-                    columns[1].heading(egui::RichText::new("Top Artists").color(egui::Color32::WHITE));
-                    columns[1].add_space(8.0);
-                    for artist in &self.top_artists {
-                        columns[1].label(egui::RichText::new(format!("{} ({} plays)", artist.name, artist.count)).color(egui::Color32::from_rgb(179, 179, 179)));
-                    }
-                });
+                } else {
+                    ui.heading(egui::RichText::new("Dashboard").color(egui::Color32::WHITE).size(24.0).strong());
+                    ui.add_space(16.0);
+        
+                    ui.columns(2, |columns| {
+                        columns[0].heading(egui::RichText::new("Top Tracks").color(egui::Color32::WHITE));
+                        columns[0].add_space(8.0);
+                        for track in &self.top_tracks {
+                            columns[0].label(egui::RichText::new(format!("{} ({} plays)", track.name, track.count)).color(egui::Color32::from_rgb(179, 179, 179)));
+                        }
+        
+                        columns[1].heading(egui::RichText::new("Top Artists").color(egui::Color32::WHITE));
+                        columns[1].add_space(8.0);
+                        for artist in &self.top_artists {
+                            columns[1].label(egui::RichText::new(format!("{} ({} plays)", artist.name, artist.count)).color(egui::Color32::from_rgb(179, 179, 179)));
+                        }
+                    });
+                }
             });
         });
     }

@@ -56,47 +56,47 @@ pub async fn user_playlists(spotify: &AuthCodeSpotify) -> Result<Vec<PlaylistSum
     Ok(summaries)
 }
 
-/// Fetch all tracks from a specific playlist.
 pub async fn playlist_tracks(
     spotify: &AuthCodeSpotify,
     playlist_id: &str,
 ) -> Result<Vec<PlaylistTrack>> {
-    use futures_util::TryStreamExt;
+    use futures_util::StreamExt;
     use rspotify::model::{PlayableItem, PlaylistId};
 
-    let id = PlaylistId::from_id(playlist_id)
+    let id_str = playlist_id.split(':').last().unwrap_or(playlist_id);
+    let id = PlaylistId::from_id(id_str)
         .context("Invalid playlist ID")?;
 
-    let stream = spotify.playlist_items(id, None, None);
-    let items: Vec<_> = stream
-        .try_collect()
-        .await
-        .context("Failed to fetch playlist tracks")?;
+    let mut stream = spotify.playlist_items(id, None, None);
+    let mut tracks = Vec::new();
 
-    let tracks = items
-        .into_iter()
-        .filter_map(|item| {
-            let playable = item.item?;
-            match playable {
-                PlayableItem::Track(t) => {
-                    let artist = t
-                        .artists
-                        .first()
-                        .map(|a| a.name.clone())
-                        .unwrap_or_default();
-                    let uri = t.id.as_ref()?.uri();
-                    Some(PlaylistTrack {
-                        name: t.name,
-                        artist,
-                        album: t.album.name,
-                        duration_ms: t.duration.num_milliseconds() as u32,
-                        spotify_uri: uri,
-                    })
+    while let Some(item_res) = stream.next().await {
+        match item_res {
+            Ok(item) => {
+                if let Some(playable) = item.item {
+                    if let PlayableItem::Track(t) = playable {
+                        let artist = t
+                            .artists
+                            .first()
+                            .map(|a| a.name.clone())
+                            .unwrap_or_default();
+                        if let Some(id) = t.id.as_ref() {
+                            tracks.push(PlaylistTrack {
+                                name: t.name,
+                                artist,
+                                album: t.album.name,
+                                duration_ms: t.duration.num_milliseconds() as u32,
+                                spotify_uri: id.uri(),
+                            });
+                        }
+                    }
                 }
-                _ => None, // anti-bloat: skip podcasts & unknown
             }
-        })
-        .collect();
+            Err(e) => {
+                log::warn!("Skipping a track due to error (often local files): {}", e);
+            }
+        }
+    }
 
     Ok(tracks)
 }

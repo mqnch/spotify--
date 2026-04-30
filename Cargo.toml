@@ -51,3 +51,5 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = "0.4"
 zip = "8.6.0"
 eframe = "0.33.3"
+egui_extras = { version = "0.33.3", features = ["all_loaders"] }
+image = { version = "0.25.10", features = ["jpeg"], default-features = false }
