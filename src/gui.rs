@@ -607,16 +607,15 @@ impl eframe::App for OnyxApp {
                                     self.play_previous();
                                 }
 
-                                let play_icon = if state.is_playing { "Ⅱ" } else { "▶" };
-                                let play_btn = egui::Button::new(
-                                    egui::RichText::new(play_icon)
-                                        .size(16.0)
-                                        .color(egui::Color32::BLACK),
+                                if play_pause_button(
+                                    ui,
+                                    play_w,
+                                    state.is_playing,
+                                    egui::Color32::WHITE,
+                                    egui::Color32::BLACK,
                                 )
-                                .fill(egui::Color32::WHITE)
-                                .corner_radius(16);
-
-                                if ui.add_sized([play_w, play_w], play_btn).clicked() {
+                                .clicked()
+                                {
                                     if state.is_playing {
                                         self.update_position_immediately(
                                             display_position_ms,
@@ -1175,7 +1174,7 @@ impl OnyxApp {
         playlist_state: &PlaylistLoadState,
         playback_state: &PlaybackState,
     ) {
-        let tracks = &playlist_state.tracks;
+        let tracks = playlist_state.tracks.clone();
         let total_duration_ms: u64 = tracks.iter().map(|track| track.duration_ms as u64).sum();
 
         ui.horizontal(|ui| {
@@ -1236,14 +1235,15 @@ impl OnyxApp {
         ui.add_space(24.0);
         let playlist_is_playing = self.playlist_is_current(playlist) && playback_state.is_playing;
         ui.horizontal(|ui| {
-            let play_btn = egui::Button::new(
-                egui::RichText::new(if playlist_is_playing { "Ⅱ" } else { "▶" })
-                    .color(egui::Color32::BLACK)
-                    .size(22.0),
+            if play_pause_button(
+                ui,
+                48.0,
+                playlist_is_playing,
+                egui::Color32::from_rgb(30, 215, 96),
+                egui::Color32::BLACK,
             )
-            .fill(egui::Color32::from_rgb(30, 215, 96))
-            .corner_radius(24);
-            if ui.add_sized([48.0, 48.0], play_btn).clicked() {
+            .clicked()
+            {
                 if playlist_is_playing {
                     let pos = display_position_ms(playback_state);
                     self.update_position_immediately(pos, false);
@@ -1302,7 +1302,15 @@ impl OnyxApp {
             .show_rows(ui, row_height, tracks.len(), |ui, row_range| {
                 for row in row_range {
                     let track = &tracks[row];
-                    self.render_track_row(ui, row, track, playback_state, row_height);
+                    self.render_track_row(
+                        ui,
+                        playlist,
+                        &tracks,
+                        row,
+                        track,
+                        playback_state,
+                        row_height,
+                    );
                 }
             });
     }
@@ -1323,6 +1331,8 @@ impl OnyxApp {
     fn render_track_row(
         &mut self,
         ui: &mut egui::Ui,
+        playlist: &PlaylistSummary,
+        tracks: &[PlaylistTrack],
         row: usize,
         track: &PlaylistTrack,
         playback_state: &PlaybackState,
@@ -1337,7 +1347,7 @@ impl OnyxApp {
                 .rect_filled(rect, 4.0, egui::Color32::from_rgb(40, 40, 40));
         }
         if resp.clicked() {
-            self.play_track(track);
+            self.start_playlist_at(playlist.id.clone(), tracks.to_vec(), row);
         }
 
         let content_rect = rect.shrink2(egui::vec2(16.0, 4.0));
@@ -1503,57 +1513,7 @@ impl OnyxApp {
             ui.heading(egui::RichText::new("Equalizer").color(egui::Color32::WHITE));
             ui.add_space(8.0);
 
-            let mut equalizer_changed = false;
-            equalizer_changed |= ui
-                .checkbox(&mut self.user_settings.equalizer.enabled, "Enable equalizer")
-                .changed();
-            equalizer_changed |= ui
-                .add(
-                    egui::Slider::new(&mut self.user_settings.equalizer.preamp_db, -12.0..=12.0)
-                        .text("Preamp dB"),
-                )
-                .changed();
-
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Flat").clicked() {
-                    self.user_settings.equalizer = EqualizerSettings::preset_flat();
-                    equalizer_changed = true;
-                }
-                if ui.button("Bass Boost").clicked() {
-                    self.user_settings.equalizer = EqualizerSettings::preset_bass_boost();
-                    equalizer_changed = true;
-                }
-                if ui.button("Treble Boost").clicked() {
-                    self.user_settings.equalizer = EqualizerSettings::preset_treble_boost();
-                    equalizer_changed = true;
-                }
-                if ui.button("Vocal").clicked() {
-                    self.user_settings.equalizer = EqualizerSettings::preset_vocal();
-                    equalizer_changed = true;
-                }
-            });
-
-            ui.add_space(12.0);
-            for (idx, band) in EQ_BANDS.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(
-                        egui::RichText::new(band.label)
-                            .color(egui::Color32::from_rgb(179, 179, 179))
-                            .size(12.0),
-                    );
-                    equalizer_changed |= ui
-                        .add(
-                            egui::Slider::new(
-                                &mut self.user_settings.equalizer.bands_db[idx],
-                                -12.0..=12.0,
-                            )
-                            .text("dB"),
-                        )
-                        .changed();
-                });
-            }
+            let equalizer_changed = self.render_equalizer_card(ui);
 
             if equalizer_changed {
                 self.apply_equalizer_settings();
@@ -1569,6 +1529,175 @@ impl OnyxApp {
             Ok(()) => self.settings_status = Some("Equalizer settings saved.".to_string()),
             Err(e) => self.settings_status = Some(format!("Failed to save equalizer settings: {}", e)),
         }
+    }
+
+    fn render_equalizer_card(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        let card_width = ui.available_width().min(780.0);
+        let card_height = 385.0;
+        let (card_rect, _) =
+            ui.allocate_exact_size(egui::vec2(card_width, card_height), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(card_rect, 6.0, egui::Color32::from_rgb(31, 31, 31));
+
+        let top_rect = egui::Rect::from_min_max(
+            card_rect.min + egui::vec2(20.0, 16.0),
+            egui::pos2(card_rect.right() - 20.0, card_rect.top() + 58.0),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(top_rect), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Presets")
+                        .color(egui::Color32::from_rgb(179, 179, 179))
+                        .size(13.0),
+                );
+                egui::ComboBox::from_id_salt("equalizer_preset")
+                    .selected_text(equalizer_preset_name(&self.user_settings.equalizer))
+                    .width(150.0)
+                    .show_ui(ui, |ui| {
+                        changed |= equalizer_preset_option(
+                            ui,
+                            "Flat",
+                            &mut self.user_settings.equalizer,
+                            EqualizerSettings::preset_flat(),
+                        );
+                        changed |= equalizer_preset_option(
+                            ui,
+                            "Bass Booster",
+                            &mut self.user_settings.equalizer,
+                            EqualizerSettings::preset_bass_boost(),
+                        );
+                        changed |= equalizer_preset_option(
+                            ui,
+                            "Treble Booster",
+                            &mut self.user_settings.equalizer,
+                            EqualizerSettings::preset_treble_boost(),
+                        );
+                        changed |= equalizer_preset_option(
+                            ui,
+                            "Vocal",
+                            &mut self.user_settings.equalizer,
+                            EqualizerSettings::preset_vocal(),
+                        );
+                    });
+                ui.add_space(20.0);
+                changed |= ui
+                    .toggle_value(&mut self.user_settings.equalizer.enabled, "Enabled")
+                    .changed();
+            });
+        });
+
+        let graph_rect = egui::Rect::from_min_max(
+            card_rect.min + egui::vec2(72.0, 102.0),
+            card_rect.max - egui::vec2(72.0, 88.0),
+        );
+        let label_color = egui::Color32::from_rgb(179, 179, 179);
+        ui.painter().text(
+            egui::pos2(card_rect.left() + 25.0, graph_rect.top() - 6.0),
+            egui::Align2::LEFT_TOP,
+            "+12dB",
+            egui::FontId::proportional(12.0),
+            label_color,
+        );
+        ui.painter().text(
+            egui::pos2(card_rect.left() + 25.0, graph_rect.bottom() - 8.0),
+            egui::Align2::LEFT_BOTTOM,
+            "-12dB",
+            egui::FontId::proportional(12.0),
+            label_color,
+        );
+
+        let grid = egui::Color32::from_rgb(70, 70, 70);
+        for idx in 0..EQ_BANDS.len() {
+            let x = band_x(graph_rect, idx);
+            ui.painter().line_segment(
+                [egui::pos2(x, graph_rect.top()), egui::pos2(x, graph_rect.bottom())],
+                egui::Stroke::new(1.0, grid),
+            );
+        }
+        let zero_y = db_to_graph_y(graph_rect, 0.0);
+        ui.painter().line_segment(
+            [
+                egui::pos2(graph_rect.left(), zero_y),
+                egui::pos2(graph_rect.right(), zero_y),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(82, 82, 82)),
+        );
+
+        let points: Vec<egui::Pos2> = self
+            .user_settings
+            .equalizer
+            .bands_db
+            .iter()
+            .enumerate()
+            .map(|(idx, gain)| egui::pos2(band_x(graph_rect, idx), db_to_graph_y(graph_rect, *gain)))
+            .collect();
+        let mut fill_points = Vec::with_capacity(points.len() + 2);
+        fill_points.push(egui::pos2(graph_rect.left(), graph_rect.bottom()));
+        fill_points.extend(points.iter().copied());
+        fill_points.push(egui::pos2(graph_rect.right(), graph_rect.bottom()));
+        ui.painter().add(egui::Shape::convex_polygon(
+            fill_points,
+            egui::Color32::from_rgba_unmultiplied(30, 215, 96, 70),
+            egui::Stroke::NONE,
+        ));
+
+        ui.painter().add(egui::Shape::line(
+            points.clone(),
+            egui::Stroke::new(3.0, egui::Color32::from_rgb(30, 215, 96)),
+        ));
+
+        for (idx, point) in points.iter().enumerate() {
+            let hit_rect = egui::Rect::from_center_size(*point, egui::vec2(22.0, 22.0));
+            let response = ui.interact(hit_rect, ui.id().with(("eq_band", idx)), egui::Sense::drag());
+            if response.dragged() {
+                if let Some(pointer) = response.interact_pointer_pos() {
+                    self.user_settings.equalizer.bands_db[idx] =
+                        graph_y_to_db(graph_rect, pointer.y).clamp(-12.0, 12.0);
+                    changed = true;
+                }
+            }
+            ui.painter().circle_filled(*point, 4.0, egui::Color32::WHITE);
+        }
+
+        for (idx, band) in EQ_BANDS.iter().enumerate() {
+            ui.painter().text(
+                egui::pos2(band_x(graph_rect, idx), graph_rect.bottom() + 20.0),
+                egui::Align2::CENTER_CENTER,
+                band.label,
+                egui::FontId::proportional(12.0),
+                label_color,
+            );
+        }
+
+        let controls_rect = egui::Rect::from_min_max(
+            egui::pos2(card_rect.left() + 24.0, card_rect.bottom() - 48.0),
+            egui::pos2(card_rect.right() - 24.0, card_rect.bottom() - 14.0),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Preamp")
+                        .color(label_color)
+                        .size(12.0),
+                );
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.user_settings.equalizer.preamp_db, -12.0..=12.0)
+                            .show_value(true)
+                            .suffix(" dB"),
+                    )
+                    .changed();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Reset").clicked() {
+                        self.user_settings.equalizer = EqualizerSettings::preset_flat();
+                        changed = true;
+                    }
+                });
+            });
+        });
+
+        changed
     }
 
     fn play_track(&self, track: &PlaylistTrack) {
@@ -1695,6 +1824,34 @@ impl OnyxApp {
         self.play_queue_index(0);
     }
 
+    fn start_playlist_at(&mut self, playlist_id: String, tracks: Vec<PlaylistTrack>, index: usize) {
+        if tracks.is_empty() {
+            self.pending_autoplay_playlist_id = Some(playlist_id);
+            return;
+        }
+
+        let start_index = index.min(tracks.len().saturating_sub(1));
+        self.queue_playlist_id = Some(playlist_id);
+        self.pending_queue_index = None;
+
+        if self.shuffle {
+            let current_track = tracks[start_index].clone();
+            let mut upcoming: Vec<_> = tracks
+                .into_iter()
+                .enumerate()
+                .filter_map(|(idx, track)| (idx != start_index).then_some(track))
+                .collect();
+            shuffle_tracks(&mut upcoming);
+            self.queue.clear();
+            self.queue.push(current_track);
+            self.queue.extend(upcoming);
+            self.play_queue_index(0);
+        } else {
+            self.queue = tracks;
+            self.play_queue_index(start_index);
+        }
+    }
+
     fn play_queue_index(&mut self, index: usize) {
         let now = Instant::now();
         let should_defer = self
@@ -1802,6 +1959,114 @@ fn settings_text_field(ui: &mut egui::Ui, label: &str, value: &mut String, passw
             .desired_width((ui.available_width() * 0.7).max(260.0)),
     );
     ui.add_space(8.0);
+}
+
+fn equalizer_preset_option(
+    ui: &mut egui::Ui,
+    label: &str,
+    settings: &mut EqualizerSettings,
+    preset: EqualizerSettings,
+) -> bool {
+    if ui.selectable_label(false, label).clicked() {
+        *settings = preset;
+        true
+    } else {
+        false
+    }
+}
+
+fn equalizer_preset_name(settings: &EqualizerSettings) -> &'static str {
+    if equalizer_matches(settings, &EqualizerSettings::preset_flat()) {
+        "Flat"
+    } else if equalizer_matches(settings, &EqualizerSettings::preset_bass_boost()) {
+        "Bass Booster"
+    } else if equalizer_matches(settings, &EqualizerSettings::preset_treble_boost()) {
+        "Treble Booster"
+    } else if equalizer_matches(settings, &EqualizerSettings::preset_vocal()) {
+        "Vocal"
+    } else {
+        "Custom"
+    }
+}
+
+fn equalizer_matches(a: &EqualizerSettings, b: &EqualizerSettings) -> bool {
+    a.enabled == b.enabled
+        && (a.preamp_db - b.preamp_db).abs() < 0.05
+        && a.bands_db
+            .iter()
+            .zip(b.bands_db.iter())
+            .all(|(left, right)| (*left - *right).abs() < 0.05)
+}
+
+fn band_x(rect: egui::Rect, idx: usize) -> f32 {
+    if EQ_BANDS.len() <= 1 {
+        return rect.center().x;
+    }
+    rect.left() + rect.width() * idx as f32 / (EQ_BANDS.len() - 1) as f32
+}
+
+fn db_to_graph_y(rect: egui::Rect, db: f32) -> f32 {
+    let t = ((db.clamp(-12.0, 12.0) + 12.0) / 24.0).clamp(0.0, 1.0);
+    rect.bottom() - rect.height() * t
+}
+
+fn graph_y_to_db(rect: egui::Rect, y: f32) -> f32 {
+    let t = ((rect.bottom() - y) / rect.height()).clamp(0.0, 1.0);
+    t * 24.0 - 12.0
+}
+
+fn play_pause_button(
+    ui: &mut egui::Ui,
+    size: f32,
+    is_playing: bool,
+    fill_color: egui::Color32,
+    icon_color: egui::Color32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let fill = if response.hovered() {
+        lighten(fill_color, 18)
+    } else {
+        fill_color
+    };
+    ui.painter().circle_filled(rect.center(), size * 0.5, fill);
+
+    if is_playing {
+        let bar_w = size * 0.13;
+        let bar_h = size * 0.42;
+        let gap = size * 0.12;
+        let center = rect.center();
+        for x_offset in [-(gap + bar_w) / 2.0, (gap + bar_w) / 2.0] {
+            let bar = egui::Rect::from_center_size(
+                center + egui::vec2(x_offset, 0.0),
+                egui::vec2(bar_w, bar_h),
+            );
+            ui.painter().rect_filled(bar, bar_w * 0.45, icon_color);
+        }
+    } else {
+        let center = rect.center() + egui::vec2(size * 0.035, 0.0);
+        let h = size * 0.44;
+        let w = size * 0.36;
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![
+                center + egui::vec2(-w * 0.42, -h * 0.5),
+                center + egui::vec2(-w * 0.42, h * 0.5),
+                center + egui::vec2(w * 0.58, 0.0),
+            ],
+            icon_color,
+            egui::Stroke::NONE,
+        ));
+    }
+
+    response
+}
+
+fn lighten(color: egui::Color32, amount: u8) -> egui::Color32 {
+    egui::Color32::from_rgb(
+        color.r().saturating_add(amount),
+        color.g().saturating_add(amount),
+        color.b().saturating_add(amount),
+    )
 }
 
 fn icon_button(ui: &mut egui::Ui, kind: IconKind, size: f32) -> egui::Response {
