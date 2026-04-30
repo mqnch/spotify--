@@ -51,6 +51,7 @@ pub async fn authenticate(config: &AppConfig) -> Result<AuthCodeSpotify> {
     };
 
     let spotify = AuthCodeSpotify::with_config(creds, oauth, rspotify_config);
+    let cache_only = crate::spotify_api::cache_only_mode();
 
     // ── 2. Try to use a cached token first ───────────────────────────
     // If a valid (or refreshable) token is on disk, skip the browser flow.
@@ -59,6 +60,11 @@ pub async fn authenticate(config: &AppConfig) -> Result<AuthCodeSpotify> {
         // Place the cached token into the client.
         *spotify.token.lock().await.unwrap() = Some(token);
 
+        if cache_only {
+            println!("✓ Spotify API disabled; using cached token without verification.");
+            return Ok(spotify);
+        }
+
         // Attempt a lightweight API call to verify the token is still good.
         if spotify.current_user().await.is_ok() {
             println!("✓ Spotify authenticated (cached token).");
@@ -66,6 +72,12 @@ pub async fn authenticate(config: &AppConfig) -> Result<AuthCodeSpotify> {
         }
         // Token was invalid/expired and couldn't refresh — fall through
         // to the full browser flow.
+    }
+
+    if cache_only {
+        return Err(anyhow!(
+            "ONYX_CACHE_ONLY=1 requires an existing cached Spotify token"
+        ));
     }
 
     // ── 3. Generate the authorization URL ────────────────────────────

@@ -4,9 +4,10 @@
 /// skip, seek, volume) and an event channel for position tracking and
 /// track-change notifications.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use crate::app_settings::{EQ_BANDS, EqualizerSettings};
 use librespot::core::{
     authentication::Credentials as LibrespotCredentials,
     cache::Cache,
@@ -15,11 +16,14 @@ use librespot::core::{
     spotify_uri::SpotifyUri,
 };
 use librespot::playback::{
-    audio_backend,
+    audio_backend::{self, Sink, SinkResult},
     config::PlayerConfig,
+    convert::Converter,
+    decoder::AudioPacket,
     mixer::{self, MixerConfig},
     player::{Player, PlayerEvent, PlayerEventChannel},
 };
+use librespot::playback::{NUM_CHANNELS, SAMPLE_RATE};
 use tokio::sync::mpsc;
 
 // ───────────────────────────────────────────────────────────────────
@@ -41,6 +45,7 @@ pub enum AudioCmd {
     Stop,
     Seek { position_ms: u32 },
     SetVolume { volume_u16: u16 },
+    SetEqualizer(EqualizerSettings),
     Shutdown,
 }
 
@@ -57,6 +62,18 @@ pub struct AudioHandle {
 pub struct AudioEngine;
 
 impl AudioEngine {
+    pub fn offline() -> AudioHandle {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<AudioCmd>();
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                if matches!(cmd, AudioCmd::Shutdown) {
+                    break;
+                }
+            }
+        });
+        AudioHandle { cmd_tx }
+    }
+
     /// Spin up the librespot session + player and return a command handle.
     ///
     /// Authentication uses librespot's built-in OAuth flow (opens a
@@ -66,6 +83,7 @@ impl AudioEngine {
     /// subsystems (telemetry, GUI) can react to playback state changes.
     pub async fn start(
         event_tx: mpsc::UnboundedSender<PlayerEvent>,
+        equalizer: EqualizerSettings,
     ) -> Result<AudioHandle> {
         // ── 1. Librespot session ─────────────────────────────────────
         let session_config = SessionConfig::default();
@@ -106,12 +124,19 @@ impl AudioEngine {
 
         let backend = audio_backend::find(None)
             .expect("No audio backend found (rodio should be compiled in)");
+        let equalizer_runtime = Arc::new(Mutex::new(EqualizerRuntime::new(equalizer)));
+        let sink_equalizer = Arc::clone(&equalizer_runtime);
 
         let player = Player::new(
             player_config,
             session.clone(),
             volume_getter,
-            move || backend(None, Default::default()),
+            move || {
+                Box::new(EqualizerSink::new(
+                    backend(None, Default::default()),
+                    Arc::clone(&sink_equalizer),
+                ))
+            },
         );
 
         // ── 4. Forward player events ─────────────────────────────────
@@ -133,6 +158,7 @@ impl AudioEngine {
 
         tokio::spawn({
             let player = Arc::clone(&player);
+            let equalizer_runtime = Arc::clone(&equalizer_runtime);
             // mixer is Box<dyn Mixer>, just move it into the task.
             let mixer_for_vol = mixer;
             async move {
@@ -161,6 +187,11 @@ impl AudioEngine {
                             mixer_for_vol.set_volume(volume_u16);
                             player.emit_volume_changed_event(volume_u16);
                         }
+                        AudioCmd::SetEqualizer(settings) => {
+                            if let Ok(mut runtime) = equalizer_runtime.lock() {
+                                runtime.set_settings(settings);
+                            }
+                        }
                         AudioCmd::Shutdown => {
                             player.stop();
                             break;
@@ -172,6 +203,150 @@ impl AudioEngine {
 
         Ok(AudioHandle { cmd_tx })
     }
+}
+
+struct EqualizerSink {
+    inner: Box<dyn Sink>,
+    runtime: Arc<Mutex<EqualizerRuntime>>,
+}
+
+impl EqualizerSink {
+    fn new(inner: Box<dyn Sink>, runtime: Arc<Mutex<EqualizerRuntime>>) -> Self {
+        Self { inner, runtime }
+    }
+}
+
+impl Sink for EqualizerSink {
+    fn start(&mut self) -> SinkResult<()> {
+        self.inner.start()
+    }
+
+    fn stop(&mut self) -> SinkResult<()> {
+        self.inner.stop()
+    }
+
+    fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
+        match packet {
+            AudioPacket::Samples(mut samples) => {
+                if let Ok(mut runtime) = self.runtime.lock() {
+                    runtime.process(&mut samples);
+                }
+                self.inner.write(AudioPacket::Samples(samples), converter)
+            }
+            AudioPacket::Raw(samples) => self.inner.write(AudioPacket::Raw(samples), converter),
+        }
+    }
+}
+
+struct EqualizerRuntime {
+    settings: EqualizerSettings,
+    filters: Vec<[Biquad; NUM_CHANNELS as usize]>,
+}
+
+impl EqualizerRuntime {
+    fn new(settings: EqualizerSettings) -> Self {
+        let filters = build_filters(&settings);
+        Self { settings, filters }
+    }
+
+    fn set_settings(&mut self, settings: EqualizerSettings) {
+        self.settings = settings;
+        self.filters = build_filters(&self.settings);
+    }
+
+    fn process(&mut self, samples: &mut [f64]) {
+        if !self.settings.enabled {
+            return;
+        }
+
+        let preamp = db_to_gain(self.settings.preamp_db);
+        for frame in samples.chunks_mut(NUM_CHANNELS as usize) {
+            for (channel, sample) in frame.iter_mut().enumerate() {
+                let mut value = *sample * preamp;
+                for band in &mut self.filters {
+                    value = band[channel].process(value);
+                }
+                *sample = value.clamp(-1.0, 1.0);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Biquad {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    z1: f64,
+    z2: f64,
+}
+
+impl Biquad {
+    fn peaking_eq(frequency_hz: f32, gain_db: f32, q: f64) -> Self {
+        if gain_db.abs() < 0.01 {
+            return Self::identity();
+        }
+
+        let frequency_hz = frequency_hz as f64;
+        let gain_db = gain_db as f64;
+        let a = 10.0_f64.powf(gain_db / 40.0);
+        let omega = 2.0 * std::f64::consts::PI * frequency_hz / SAMPLE_RATE as f64;
+        let alpha = omega.sin() / (2.0 * q);
+        let cos = omega.cos();
+
+        let b0 = 1.0 + alpha * a;
+        let b1 = -2.0 * cos;
+        let b2 = 1.0 - alpha * a;
+        let a0 = 1.0 + alpha / a;
+        let a1 = -2.0 * cos;
+        let a2 = 1.0 - alpha / a;
+
+        Self {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+
+    fn identity() -> Self {
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+
+    fn process(&mut self, sample: f64) -> f64 {
+        let output = self.b0 * sample + self.z1;
+        self.z1 = self.b1 * sample - self.a1 * output + self.z2;
+        self.z2 = self.b2 * sample - self.a2 * output;
+        output
+    }
+}
+
+fn build_filters(settings: &EqualizerSettings) -> Vec<[Biquad; NUM_CHANNELS as usize]> {
+    EQ_BANDS
+        .iter()
+        .zip(settings.bands_db.iter())
+        .map(|(band, gain_db)| {
+            let filter = Biquad::peaking_eq(band.frequency_hz, *gain_db, 1.0);
+            [filter; NUM_CHANNELS as usize]
+        })
+        .collect()
+}
+
+fn db_to_gain(db: f32) -> f64 {
+    10.0_f64.powf(db as f64 / 20.0)
 }
 
 // ───────────────────────────────────────────────────────────────────
