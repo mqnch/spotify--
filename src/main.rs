@@ -1,6 +1,7 @@
-mod auth;
 mod app_settings;
+mod auth;
 mod config;
+mod downloads;
 mod gui;
 mod lastfm;
 mod metadata;
@@ -176,7 +177,7 @@ fn main() -> Result<()> {
                             st.track_name.clear();
                             st.artist_name.clear();
                             st.artwork_url = None;
-                        st.spotify_uri = None;
+                            st.spotify_uri = None;
                             st.position_ms = 0;
                             st.position_anchor_ms = 0;
                             st.position_updated_at = None;
@@ -204,7 +205,14 @@ fn main() -> Result<()> {
                 app_settings::UserSettings,
             ),
             anyhow::Error,
-        >((spotify, audio, db, playback_state, app_config, user_settings))
+        >((
+            spotify,
+            audio,
+            db,
+            playback_state,
+            app_config,
+            user_settings,
+        ))
     })?;
 
     let audio_cmd_tx = audio.cmd_tx.clone();

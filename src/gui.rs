@@ -1,10 +1,12 @@
-use crate::app_settings::{EQ_BANDS, EqualizerSettings, UserSettings};
+use crate::app_settings::{EQ_BANDS, EqualizerSettings, PlaylistOrderingSettings, UserSettings};
 use crate::config::AppConfig;
+use crate::downloads::{DOWNLOAD_DOWNLOADED, DOWNLOAD_DOWNLOADING, DownloadStatuses};
 use crate::player::AudioCmd;
 use crate::spotify_api::{PlaylistSummary, PlaylistTrack};
 use crate::telemetry::TelemetryDb;
 use eframe::egui;
 use rspotify::AuthCodeSpotify;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
@@ -160,6 +162,8 @@ struct TrackTableRects {
     duration: egui::Rect,
 }
 
+const MAX_RECENT_PLAYLISTS: usize = 50;
+
 pub struct OnyxApp {
     pub spotify: AuthCodeSpotify,
     pub audio_cmd_tx: UnboundedSender<AudioCmd>,
@@ -178,8 +182,11 @@ pub struct OnyxApp {
     pub rt: tokio::runtime::Handle,
     playlists: Arc<Mutex<Vec<PlaylistSummary>>>,
     playlists_status: Arc<Mutex<String>>,
+    download_statuses: DownloadStatuses,
+    download_tasks: HashMap<String, JoinHandle<()>>,
     selected_playlist: Option<PlaylistSummary>,
     playlist_state: Arc<Mutex<PlaylistLoadState>>,
+    playlist_colors: Arc<Mutex<HashMap<String, Option<[u8; 3]>>>>,
     playlist_generation: u64,
     playlist_task: Option<JoinHandle<()>>,
     queue: Vec<PlaylistTrack>,
@@ -245,6 +252,20 @@ impl OnyxApp {
         };
         let playlists = Arc::new(Mutex::new(cached_playlists));
         let playlists_status = Arc::new(Mutex::new(playlists_status_text));
+        let download_statuses = Arc::new(Mutex::new(
+            crate::playlist_cache::PlaylistCache::new()
+                .and_then(|cache| cache.load_download_statuses())
+                .map(|statuses| {
+                    statuses
+                        .into_iter()
+                        .map(|status| (status.playlist_id.clone(), status))
+                        .collect()
+                })
+                .unwrap_or_else(|e| {
+                    log::warn!("Failed to load download statuses: {}", e);
+                    HashMap::new()
+                }),
+        ));
         let playlists_clone = playlists.clone();
         let playlists_status_clone = playlists_status.clone();
         let spotify_clone = spotify.clone();
@@ -317,8 +338,11 @@ impl OnyxApp {
             rt,
             playlists,
             playlists_status,
+            download_statuses,
+            download_tasks: HashMap::new(),
             selected_playlist: None,
             playlist_state: Arc::new(Mutex::new(PlaylistLoadState::default())),
+            playlist_colors: Arc::new(Mutex::new(HashMap::new())),
             playlist_generation: 0,
             playlist_task: None,
             queue: Vec::new(),
@@ -352,6 +376,7 @@ impl OnyxApp {
         let generation = self.playlist_generation;
         self.selected_playlist = Some(playlist.clone());
         self.main_view = MainView::Playlist;
+        self.ensure_playlist_color(&playlist, ctx);
         let cache_only = crate::spotify_api::cache_only_mode();
 
         let cached_tracks = crate::playlist_cache::PlaylistCache::new()
@@ -492,6 +517,39 @@ impl OnyxApp {
             ctx.request_repaint();
         }));
     }
+
+    fn ensure_playlist_color(&mut self, playlist: &PlaylistSummary, ctx: &egui::Context) {
+        let Some(url) = playlist
+            .image_url
+            .clone()
+            .or_else(|| playlist.thumbnail_url.clone())
+        else {
+            if let Ok(mut colors) = self.playlist_colors.lock() {
+                colors.entry(playlist.id.clone()).or_insert(None);
+            }
+            return;
+        };
+
+        if let Ok(mut colors) = self.playlist_colors.lock() {
+            if colors.contains_key(&playlist.id) {
+                return;
+            }
+            colors.insert(playlist.id.clone(), None);
+        } else {
+            return;
+        }
+
+        let playlist_id = playlist.id.clone();
+        let colors = self.playlist_colors.clone();
+        let ctx = ctx.clone();
+        self.rt.spawn(async move {
+            let color = fetch_playlist_color(url).await;
+            if let Ok(mut colors) = colors.lock() {
+                colors.insert(playlist_id, color);
+            }
+            ctx.request_repaint();
+        });
+    }
 }
 
 impl eframe::App for OnyxApp {
@@ -582,7 +640,8 @@ impl eframe::App for OnyxApp {
                 // Center Section
                 ui.allocate_ui_at_rect(center_rect, |ui| {
                     ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                        ui.add_space(2.0);
+                        // Nudge transport controls slightly lower for visual centering.
+                        ui.add_space(4.0);
                         // Controls Row
                         ui.allocate_ui_with_layout(
                             egui::vec2(center_rect.width(), 30.0),
@@ -1033,6 +1092,7 @@ impl eframe::App for OnyxApp {
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
                         let playlists = { self.playlists.lock().unwrap().clone() };
+                        let playlists = self.ordered_playlists(playlists);
                         let status = self
                             .playlists_status
                             .lock()
@@ -1072,6 +1132,21 @@ impl eframe::App for OnyxApp {
                                 ui.painter().rect_filled(paint_rect, 4.0, bg);
                             }
 
+                            let is_pinned = self.is_playlist_pinned(&p.id);
+                            let status_text = self.playlist_download_status_text(&p.id);
+                            let right_reserved = if is_pinned { 22.0 } else { 8.0 };
+
+                            resp.context_menu(|ui| {
+                                let pin_label = if is_pinned { "Unpin" } else { "Pin" };
+                                if ui.button(pin_label).clicked() {
+                                    self.toggle_playlist_pin(&p.id);
+                                    ui.close();
+                                    ctx.request_repaint();
+                                }
+                                ui.separator();
+                                self.render_download_menu(ui, ctx, &p);
+                            });
+
                             if resp.double_clicked() {
                                 self.select_playlist(p.clone(), ctx);
                                 self.start_playlist_when_ready(&p.id);
@@ -1106,21 +1181,35 @@ impl eframe::App for OnyxApp {
                             };
                             let name_rect = egui::Rect::from_min_size(
                                 egui::pos2(text_left, rect.top() + 10.0),
-                                egui::vec2((rect.right() - text_left - 8.0).max(20.0), 18.0),
+                                egui::vec2(
+                                    (rect.right() - text_left - right_reserved).max(20.0),
+                                    18.0,
+                                ),
                             );
                             let meta_rect = egui::Rect::from_min_size(
                                 egui::pos2(text_left, rect.top() + 29.0),
-                                egui::vec2((rect.right() - text_left - 8.0).max(20.0), 16.0),
+                                egui::vec2(
+                                    (rect.right() - text_left - right_reserved).max(20.0),
+                                    16.0,
+                                ),
                             );
                             paint_left_text(ui, name_rect, &p.name, name_color, 13.0, true);
+                            let meta_text = if let Some(status_text) = status_text {
+                                format!("Playlist • {} tracks • {}", p.track_count, status_text)
+                            } else {
+                                format!("Playlist • {} tracks", p.track_count)
+                            };
                             paint_left_text(
                                 ui,
                                 meta_rect,
-                                &format!("Playlist • {} tracks", p.track_count),
+                                &meta_text,
                                 egui::Color32::from_rgb(179, 179, 179),
                                 12.0,
                                 false,
                             );
+                            if is_pinned {
+                                paint_pin_indicator(ui, rect);
+                            }
                         }
                     });
             });
@@ -1133,6 +1222,19 @@ impl eframe::App for OnyxApp {
         egui::CentralPanel::default()
             .frame(central_frame)
             .show(ctx, |ui| {
+                if self.main_view == MainView::Playlist {
+                    if let Some(playlist) = self.selected_playlist.clone() {
+                        self.ensure_playlist_color(&playlist, ctx);
+                        let playlist_color = self
+                            .playlist_colors
+                            .lock()
+                            .ok()
+                            .and_then(|colors| colors.get(&playlist.id).copied().flatten())
+                            .map(playlist_gradient_color);
+                        paint_playlist_header_gradient(ui, playlist_color);
+                    }
+                }
+
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon_button(ui, IconKind::Settings, 28.0).clicked() {
@@ -1167,6 +1269,7 @@ impl OnyxApp {
         playlist_state: &PlaylistLoadState,
         playback_state: &PlaybackState,
     ) {
+        self.ensure_playlist_color(playlist, ui.ctx());
         let tracks = playlist_state.tracks.clone();
         let total_duration_ms: u64 = tracks.iter().map(|track| track.duration_ms as u64).sum();
 
@@ -1765,6 +1868,140 @@ impl OnyxApp {
         }
     }
 
+    fn ordered_playlists(&self, mut playlists: Vec<PlaylistSummary>) -> Vec<PlaylistSummary> {
+        playlists.sort_by(|left, right| {
+            compare_playlist_order(left, right, &self.user_settings.playlist_ordering)
+        });
+        playlists
+    }
+
+    fn is_playlist_pinned(&self, playlist_id: &str) -> bool {
+        self.user_settings
+            .playlist_ordering
+            .pinned_playlist_ids
+            .iter()
+            .any(|id| id == playlist_id)
+    }
+
+    fn toggle_playlist_pin(&mut self, playlist_id: &str) {
+        let pinned = &mut self.user_settings.playlist_ordering.pinned_playlist_ids;
+        if let Some(index) = pinned.iter().position(|id| id == playlist_id) {
+            pinned.remove(index);
+        } else {
+            pinned.insert(0, playlist_id.to_string());
+        }
+        self.save_user_settings_silent();
+    }
+
+    fn mark_playlist_recent(&mut self, playlist_id: &str) {
+        let recent = &mut self.user_settings.playlist_ordering.recent_playlist_ids;
+        recent.retain(|id| id != playlist_id);
+        recent.insert(0, playlist_id.to_string());
+        recent.truncate(MAX_RECENT_PLAYLISTS);
+        self.save_user_settings_silent();
+    }
+
+    fn save_user_settings_silent(&self) {
+        if let Err(e) = self.user_settings.save() {
+            log::warn!("Failed to save user settings: {}", e);
+        }
+    }
+
+    fn playlist_download_status_text(&self, playlist_id: &str) -> Option<String> {
+        let status = self
+            .download_statuses
+            .lock()
+            .ok()
+            .and_then(|statuses| statuses.get(playlist_id).cloned())?;
+
+        match status.state.as_str() {
+            DOWNLOAD_DOWNLOADING => Some(format!(
+                "Downloading {}/{}",
+                status.downloaded_count, status.total_count
+            )),
+            DOWNLOAD_DOWNLOADED => Some("Downloaded".to_string()),
+            crate::downloads::DOWNLOAD_ERROR => status
+                .last_error
+                .map(|error| format!("Download failed: {}", error))
+                .or_else(|| Some("Download failed".to_string())),
+            crate::downloads::DOWNLOAD_CANCELLED => Some("Download cancelled".to_string()),
+            _ => None,
+        }
+    }
+
+    fn render_download_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        playlist: &PlaylistSummary,
+    ) {
+        let status = self
+            .download_statuses
+            .lock()
+            .ok()
+            .and_then(|statuses| statuses.get(&playlist.id).cloned());
+        let is_downloading = status
+            .as_ref()
+            .is_some_and(|status| status.state == DOWNLOAD_DOWNLOADING);
+        let is_downloaded = status
+            .as_ref()
+            .is_some_and(|status| status.state == DOWNLOAD_DOWNLOADED);
+
+        if is_downloading {
+            if ui.button("Cancel download").clicked() {
+                self.cancel_playlist_download(&playlist.id);
+                ui.close();
+                ctx.request_repaint();
+            }
+        } else if is_downloaded {
+            if ui.button("Remove download").clicked() {
+                self.remove_playlist_download(&playlist.id);
+                ui.close();
+                ctx.request_repaint();
+            }
+        } else if ui.button("Download playlist").clicked() {
+            self.start_playlist_download(playlist.clone(), ctx.clone());
+            ui.close();
+            ctx.request_repaint();
+        }
+    }
+
+    fn start_playlist_download(&mut self, playlist: PlaylistSummary, ctx: egui::Context) {
+        if self.download_tasks.contains_key(&playlist.id) {
+            return;
+        }
+
+        let cached_tracks = crate::playlist_cache::PlaylistCache::new()
+            .ok()
+            .and_then(|cache| cache.load_tracks(&playlist.id).ok().flatten())
+            .map(|cached| cached.tracks)
+            .unwrap_or_default();
+        let task = crate::downloads::spawn_playlist_download(
+            &self.rt,
+            self.spotify.clone(),
+            self.audio_cmd_tx.clone(),
+            self.download_statuses.clone(),
+            playlist.clone(),
+            cached_tracks,
+            ctx,
+        );
+        self.download_tasks.insert(playlist.id, task);
+    }
+
+    fn cancel_playlist_download(&mut self, playlist_id: &str) {
+        if let Some(task) = self.download_tasks.remove(playlist_id) {
+            task.abort();
+        }
+        crate::downloads::set_cancelled(&self.download_statuses, playlist_id);
+    }
+
+    fn remove_playlist_download(&mut self, playlist_id: &str) {
+        if let Some(task) = self.download_tasks.remove(playlist_id) {
+            task.abort();
+        }
+        crate::downloads::remove_download(&self.download_statuses, playlist_id);
+    }
+
     fn toggle_shuffle(&mut self) {
         self.set_shuffle(!self.shuffle);
     }
@@ -1839,6 +2076,7 @@ impl OnyxApp {
             return;
         }
 
+        self.mark_playlist_recent(&playlist_id);
         self.queue = tracks;
         self.queue_playlist_id = Some(playlist_id);
         if self.shuffle {
@@ -1855,6 +2093,7 @@ impl OnyxApp {
         }
 
         let start_index = index.min(tracks.len().saturating_sub(1));
+        self.mark_playlist_recent(&playlist_id);
         self.queue_playlist_id = Some(playlist_id);
         self.pending_queue_index = None;
 
@@ -2105,6 +2344,118 @@ fn lighten(color: egui::Color32, amount: u8) -> egui::Color32 {
     )
 }
 
+async fn fetch_playlist_color(url: String) -> Option<[u8; 3]> {
+    let response = reqwest::get(url).await.ok()?.error_for_status().ok()?;
+    let bytes = response.bytes().await.ok()?;
+    tokio::task::spawn_blocking(move || dominant_playlist_color(&bytes))
+        .await
+        .ok()
+        .flatten()
+}
+
+fn dominant_playlist_color(bytes: &[u8]) -> Option<[u8; 3]> {
+    let image = image::load_from_memory(bytes)
+        .ok()?
+        .thumbnail(96, 96)
+        .to_rgb8();
+    let mut bins = vec![(0_u32, 0_u32, 0_u32, 0_u32); 512];
+    let mut fallback = (0_u32, 0_u32, 0_u32, 0_u32);
+
+    for pixel in image.pixels() {
+        let [r, g, b] = pixel.0;
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let saturation = max - min;
+
+        if max > 24 && min < 244 {
+            fallback.0 += r as u32;
+            fallback.1 += g as u32;
+            fallback.2 += b as u32;
+            fallback.3 += 1;
+        }
+
+        if max < 36 || min > 235 || saturation < 18 {
+            continue;
+        }
+
+        let brightness_penalty = if max > 225 || max < 52 { 20 } else { 0 };
+        let weight = 1 + saturation.saturating_sub(brightness_penalty) as u32;
+        let index = ((r as usize / 32) * 64) + ((g as usize / 32) * 8) + (b as usize / 32);
+        let bin = &mut bins[index];
+        bin.0 += r as u32 * weight;
+        bin.1 += g as u32 * weight;
+        bin.2 += b as u32 * weight;
+        bin.3 += weight;
+    }
+
+    let best = bins
+        .into_iter()
+        .filter(|bin| bin.3 > 0)
+        .max_by_key(|bin| bin.3)
+        .or_else(|| if fallback.3 > 0 { Some(fallback) } else { None })?;
+
+    Some([
+        (best.0 / best.3) as u8,
+        (best.1 / best.3) as u8,
+        (best.2 / best.3) as u8,
+    ])
+}
+
+fn playlist_gradient_color(color: [u8; 3]) -> egui::Color32 {
+    let [r, g, b] = color;
+    let max = r.max(g).max(b);
+    let lift = 88_u8.saturating_sub(max);
+    egui::Color32::from_rgb(
+        r.saturating_add(lift / 2),
+        g.saturating_add(lift / 2),
+        b.saturating_add(lift / 2),
+    )
+}
+
+fn paint_playlist_header_gradient(ui: &egui::Ui, color: Option<egui::Color32>) {
+    let Some(color) = color else {
+        return;
+    };
+
+    let base = egui::Color32::from_rgb(18, 18, 18);
+    let panel_rect = ui.max_rect().expand2(egui::vec2(24.0, 24.0));
+    let rect = egui::Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), 280.0));
+
+    let mut vertical = egui::Mesh::default();
+    let top_left = lerp_color(color, base, 0.08);
+    let top_right = lerp_color(color, base, 0.24);
+    vertical.colored_vertex(rect.left_top(), top_left);
+    vertical.colored_vertex(rect.right_top(), top_right);
+    vertical.colored_vertex(rect.right_bottom(), base);
+    vertical.colored_vertex(rect.left_bottom(), base);
+    vertical.add_triangle(0, 1, 2);
+    vertical.add_triangle(0, 2, 3);
+    ui.painter().add(egui::Shape::mesh(vertical));
+
+    let mut depth = egui::Mesh::default();
+    let transparent = egui::Color32::from_rgba_unmultiplied(18, 18, 18, 0);
+    let shaded = egui::Color32::from_rgba_unmultiplied(18, 18, 18, 92);
+    depth.colored_vertex(rect.left_top(), transparent);
+    depth.colored_vertex(rect.right_top(), shaded);
+    depth.colored_vertex(rect.right_bottom(), shaded);
+    depth.colored_vertex(rect.left_bottom(), transparent);
+    depth.add_triangle(0, 1, 2);
+    depth.add_triangle(0, 2, 3);
+    ui.painter().add(egui::Shape::mesh(depth));
+}
+
+fn lerp_color(from: egui::Color32, to: egui::Color32, t: f32) -> egui::Color32 {
+    let mix = |a: u8, b: u8| {
+        let value = a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0);
+        value.round() as u8
+    };
+    egui::Color32::from_rgb(
+        mix(from.r(), to.r()),
+        mix(from.g(), to.g()),
+        mix(from.b(), to.b()),
+    )
+}
+
 fn paint_volume_icon(ui: &egui::Ui, rect: egui::Rect, muted: bool, hovered: bool) {
     let color = if hovered {
         egui::Color32::WHITE
@@ -2142,6 +2493,35 @@ fn paint_volume_icon(ui: &egui::Ui, rect: egui::Rect, muted: bool, hovered: bool
     } else {
         paint_arc(ui, c + egui::vec2(2.5, 0.0), 5.0, -0.75, 0.75, stroke);
         paint_arc(ui, c + egui::vec2(2.5, 0.0), 8.0, -0.65, 0.65, stroke);
+    }
+}
+
+fn paint_pin_indicator(ui: &egui::Ui, row_rect: egui::Rect) {
+    const PIN_SVG: &[u8] = include_bytes!("../assets/fonts/pin.svg");
+    const PIN_URI: &str = "bytes://onyx/pin.svg";
+    let bytes = egui::load::Bytes::from(PIN_SVG);
+    ui.ctx().include_bytes(PIN_URI, bytes);
+    let rect = egui::Rect::from_center_size(
+        egui::pos2(row_rect.right() - 12.0, row_rect.center().y),
+        egui::vec2(12.0, 12.0),
+    );
+    if let Ok(texture) = ui.ctx().try_load_texture(
+        PIN_URI,
+        egui::TextureOptions::LINEAR,
+        egui::load::SizeHint::Size {
+            width: 24,
+            height: 24,
+            maintain_aspect_ratio: true,
+        },
+    ) {
+        if let egui::load::TexturePoll::Ready { texture } = texture {
+            ui.painter().image(
+                texture.id,
+                rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::from_rgb(30, 215, 96),
+            );
+        }
     }
 }
 
@@ -2311,6 +2691,36 @@ fn shuffle_tracks(tracks: &mut [PlaylistTrack]) {
         let j = (seed as usize) % (i + 1);
         tracks.swap(i, j);
     }
+}
+
+fn compare_playlist_order(
+    left: &PlaylistSummary,
+    right: &PlaylistSummary,
+    ordering: &PlaylistOrderingSettings,
+) -> std::cmp::Ordering {
+    playlist_order_rank(&left.id, ordering)
+        .cmp(&playlist_order_rank(&right.id, ordering))
+        .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+}
+
+fn playlist_order_rank(playlist_id: &str, ordering: &PlaylistOrderingSettings) -> (usize, usize) {
+    if let Some(index) = ordering
+        .pinned_playlist_ids
+        .iter()
+        .position(|id| id == playlist_id)
+    {
+        return (0, index);
+    }
+
+    if let Some(index) = ordering
+        .recent_playlist_ids
+        .iter()
+        .position(|id| id == playlist_id)
+    {
+        return (1, index);
+    }
+
+    (2, usize::MAX)
 }
 
 fn install_manrope_font(ctx: &egui::Context) {

@@ -60,7 +60,16 @@ pub struct EqualizerSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSettings {
+    #[serde(default)]
     pub equalizer: EqualizerSettings,
+    #[serde(default)]
+    pub playlist_ordering: PlaylistOrderingSettings,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlaylistOrderingSettings {
+    pub pinned_playlist_ids: Vec<String>,
+    pub recent_playlist_ids: Vec<String>,
 }
 
 impl Default for EqualizerSettings {
@@ -107,6 +116,7 @@ impl Default for UserSettings {
     fn default() -> Self {
         Self {
             equalizer: EqualizerSettings::default(),
+            playlist_ordering: PlaylistOrderingSettings::default(),
         }
     }
 }

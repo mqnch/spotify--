@@ -16,6 +16,17 @@ pub struct CachedPlaylistTracks {
     pub fetched_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PlaylistDownloadStatus {
+    pub playlist_id: String,
+    pub desired: bool,
+    pub state: String,
+    pub downloaded_count: u32,
+    pub total_count: u32,
+    pub last_error: Option<String>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
 impl PlaylistCache {
     pub fn new() -> Result<Self> {
         let db_path = get_cache_path();
@@ -66,6 +77,18 @@ impl PlaylistCache {
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist
              ON playlist_tracks(playlist_id, position)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS playlist_downloads (
+                playlist_id TEXT PRIMARY KEY,
+                desired INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                downloaded_count INTEGER NOT NULL,
+                total_count INTEGER NOT NULL,
+                last_error TEXT,
+                updated_at TEXT NOT NULL
+            )",
             [],
         )?;
         self.conn
@@ -169,6 +192,69 @@ impl PlaylistCache {
         }
 
         Ok(playlists)
+    }
+
+    pub fn load_download_statuses(&self) -> Result<Vec<PlaylistDownloadStatus>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT playlist_id, desired, state, downloaded_count, total_count, last_error, updated_at
+             FROM playlist_downloads",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let updated_at = row
+                .get::<_, Option<String>>(6)?
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc));
+            Ok(PlaylistDownloadStatus {
+                playlist_id: row.get(0)?,
+                desired: row.get::<_, i64>(1)? != 0,
+                state: row.get(2)?,
+                downloaded_count: row.get::<_, i64>(3)? as u32,
+                total_count: row.get::<_, i64>(4)? as u32,
+                last_error: row.get(5)?,
+                updated_at,
+            })
+        })?;
+
+        let mut statuses = Vec::new();
+        for row in rows {
+            statuses.push(row?);
+        }
+        Ok(statuses)
+    }
+
+    pub fn save_download_status(&self, status: &PlaylistDownloadStatus) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO playlist_downloads
+                (playlist_id, desired, state, downloaded_count, total_count, last_error, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(playlist_id) DO UPDATE SET
+                desired = excluded.desired,
+                state = excluded.state,
+                downloaded_count = excluded.downloaded_count,
+                total_count = excluded.total_count,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at",
+            params![
+                status.playlist_id,
+                if status.desired { 1 } else { 0 },
+                status.state,
+                status.downloaded_count,
+                status.total_count,
+                status.last_error,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_download_status(&self, playlist_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM playlist_downloads WHERE playlist_id = ?1",
+            [playlist_id],
+        )?;
+        Ok(())
     }
 
     pub fn save_playlist(&self, playlist: &PlaylistSummary, complete: bool) -> Result<()> {

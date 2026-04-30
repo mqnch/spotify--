@@ -3,18 +3,15 @@
 /// Provides a thread-safe control interface for playback (play, pause,
 /// skip, seek, volume) and an event channel for position tracking and
 /// track-change notifications.
-
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
 use crate::app_settings::{EQ_BANDS, EqualizerSettings};
+use anyhow::{Context, Result};
 use librespot::core::{
-    authentication::Credentials as LibrespotCredentials,
-    cache::Cache,
-    config::SessionConfig,
-    session::Session,
-    spotify_uri::SpotifyUri,
+    authentication::Credentials as LibrespotCredentials, cache::Cache, config::SessionConfig,
+    session::Session, spotify_uri::SpotifyUri,
 };
+use librespot::playback::{NUM_CHANNELS, SAMPLE_RATE};
 use librespot::playback::{
     audio_backend::{self, Sink, SinkResult},
     config::PlayerConfig,
@@ -23,7 +20,6 @@ use librespot::playback::{
     mixer::{self, MixerConfig},
     player::{Player, PlayerEvent, PlayerEventChannel},
 };
-use librespot::playback::{NUM_CHANNELS, SAMPLE_RATE};
 use tokio::sync::mpsc;
 
 // ───────────────────────────────────────────────────────────────────
@@ -40,11 +36,18 @@ pub enum AudioCmd {
         start_playing: bool,
         position_ms: u32,
     },
+    Preload {
+        uri: String,
+    },
     Play,
     Pause,
     Stop,
-    Seek { position_ms: u32 },
-    SetVolume { volume_u16: u16 },
+    Seek {
+        position_ms: u32,
+    },
+    SetVolume {
+        volume_u16: u16,
+    },
     SetEqualizer(EqualizerSettings),
     Shutdown,
 }
@@ -91,10 +94,10 @@ impl AudioEngine {
         // Cache credentials + audio files under .cache/onyx
         let cache_dir = dirs_or_default();
         let cache = Cache::new(
-            Some(cache_dir.clone()),     // credentials
-            None,                        // volume (we handle this ourselves)
+            Some(cache_dir.clone()),       // credentials
+            None,                          // volume (we handle this ourselves)
             Some(cache_dir.join("audio")), // audio file cache
-            None,                        // size limit
+            None,                          // size limit
         )
         .ok();
 
@@ -108,14 +111,16 @@ impl AudioEngine {
             .await
             .context("Failed to connect librespot session")?;
 
-        println!("✓ librespot session connected (user: {}).", session.username());
+        println!(
+            "✓ librespot session connected (user: {}).",
+            session.username()
+        );
 
         // ── 2. Mixer (software volume) ───────────────────────────────
         let mixer_config = MixerConfig::default();
         let mixer_factory = mixer::find(None) // default = "softvol"
             .expect("no mixer backend found");
-        let mixer = mixer_factory(mixer_config)
-            .context("Failed to create mixer")?;
+        let mixer = mixer_factory(mixer_config).context("Failed to create mixer")?;
 
         let volume_getter = mixer.get_soft_volume();
 
@@ -127,17 +132,12 @@ impl AudioEngine {
         let equalizer_runtime = Arc::new(Mutex::new(EqualizerRuntime::new(equalizer)));
         let sink_equalizer = Arc::clone(&equalizer_runtime);
 
-        let player = Player::new(
-            player_config,
-            session.clone(),
-            volume_getter,
-            move || {
-                Box::new(EqualizerSink::new(
-                    backend(None, Default::default()),
-                    Arc::clone(&sink_equalizer),
-                ))
-            },
-        );
+        let player = Player::new(player_config, session.clone(), volume_getter, move || {
+            Box::new(EqualizerSink::new(
+                backend(None, Default::default()),
+                Arc::clone(&sink_equalizer),
+            ))
+        });
 
         // ── 4. Forward player events ─────────────────────────────────
         let mut event_channel: PlayerEventChannel = player.get_player_event_channel();
@@ -168,16 +168,20 @@ impl AudioEngine {
                             uri,
                             start_playing,
                             position_ms,
-                        } => {
-                            match SpotifyUri::from_uri(&uri) {
-                                Ok(spotify_uri) => {
-                                    player.load(spotify_uri, start_playing, position_ms);
-                                }
-                                Err(e) => {
-                                    log::error!("Invalid Spotify URI '{}': {}", uri, e);
-                                }
+                        } => match SpotifyUri::from_uri(&uri) {
+                            Ok(spotify_uri) => {
+                                player.load(spotify_uri, start_playing, position_ms);
                             }
-                        }
+                            Err(e) => {
+                                log::error!("Invalid Spotify URI '{}': {}", uri, e);
+                            }
+                        },
+                        AudioCmd::Preload { uri } => match SpotifyUri::from_uri(&uri) {
+                            Ok(spotify_uri) => player.preload(spotify_uri),
+                            Err(e) => {
+                                log::error!("Invalid Spotify URI '{}': {}", uri, e);
+                            }
+                        },
                         AudioCmd::Play => player.play(),
                         AudioCmd::Pause => player.pause(),
                         AudioCmd::Stop => player.stop(),
@@ -393,5 +397,7 @@ async fn load_or_authenticate(session: &Session) -> Result<LibrespotCredentials>
     )
     .context("librespot OAuth failed")?;
 
-    Ok(LibrespotCredentials::with_access_token(oauth_token.access_token))
+    Ok(LibrespotCredentials::with_access_token(
+        oauth_token.access_token,
+    ))
 }
