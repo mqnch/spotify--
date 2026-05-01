@@ -255,12 +255,6 @@ pub struct OnyxApp {
     // Playback state toggles
     shuffle: bool,
     repeat: bool,
-
-    now_playing_flyout_open: bool,
-    /// Latest `SidePanel::left` outer rect (screen space), for now-playing morph alignment.
-    last_sidebar_rect: Option<egui::Rect>,
-    /// Latest bottom-bar left strip rect (screen space), for thumbnail anchor.
-    last_bottom_bar_left_rect: Option<egui::Rect>,
 }
 
 impl OnyxApp {
@@ -436,9 +430,6 @@ impl OnyxApp {
             previous_volume: u16::MAX,
             shuffle: false,
             repeat: false,
-            now_playing_flyout_open: false,
-            last_sidebar_rect: None,
-            last_bottom_bar_left_rect: None,
         }
     }
 
@@ -732,16 +723,6 @@ impl eframe::App for OnyxApp {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
 
-        const NOW_PLAYING_MORPH_SEC: f32 = 0.42;
-        let now_playing_morph_t = ctx.animate_bool_with_time_and_easing(
-            egui::Id::new("now_playing_flyout_anim"),
-            self.now_playing_flyout_open,
-            NOW_PLAYING_MORPH_SEC,
-            egui::emath::easing::cubic_in_out,
-        );
-        let hide_now_playing_bar_chip =
-            self.now_playing_flyout_open || now_playing_morph_t > 1e-4;
-
         // BOTTOM BAR (#181818)
         let mut bottom_frame = egui::Frame::default();
         bottom_frame.fill = egui::Color32::from_rgb(24, 24, 24);
@@ -770,118 +751,55 @@ impl eframe::App for OnyxApp {
                     egui::vec2(w_right, available.height()),
                 );
 
-                // Left Section
+                // Left Section (track art + title / artist)
                 ui.allocate_ui_at_rect(left_rect, |ui| {
-                    self.last_bottom_bar_left_rect = Some(left_rect);
                     let thumb = bottom_bar_thumb_rect(&left_rect);
-                    let text_left_default = thumb.right() + 12.0;
-                    let morph_e = now_playing_morph_t.clamp(0.0, 1.0);
-                    let (text_col_left, text_col_right) = if hide_now_playing_bar_chip {
-                        let under_left = self
-                            .last_sidebar_rect
-                            .map(|s| s.left() + 16.0)
-                            .unwrap_or(text_left_default);
-                        let under_right = self
-                            .last_sidebar_rect
-                            .map(|s| (s.right() - 8.0).min(left_rect.right() - 8.0))
-                            .unwrap_or(left_rect.right() - 8.0);
-                        let under_right = under_right.max(under_left + 40.0);
-                        let start_right = left_rect.right() - 8.0;
-                        let left = egui::lerp(text_left_default..=under_left, morph_e);
-                        let mut right = egui::lerp(start_right..=under_right, morph_e);
-                        right = right.max(left + 48.0).min(left_rect.right() - 8.0);
-                        (left, right)
-                    } else {
-                        (text_left_default, left_rect.right() - 8.0)
-                    };
-                    let text_top_pad = if hide_now_playing_bar_chip {
-                        egui::lerp(10.0..=4.0, morph_e)
-                    } else {
-                        10.0
-                    };
+                    let text_left = thumb.right() + 12.0;
 
                     ui.allocate_ui_at_rect(thumb, |ui| {
-                        if hide_now_playing_bar_chip {
-                            let (_, r) =
-                                ui.allocate_exact_size(thumb.size(), egui::Sense::click());
-                            if r.clicked() {
-                                self.now_playing_flyout_open = !self.now_playing_flyout_open;
-                            }
-                        } else if let Some(url) = &state.artwork_url {
-                            let art_resp = ui
-                                .add(
-                                    egui::Image::new(url)
-                                        .corner_radius(4_u8)
-                                        .fit_to_exact_size(thumb.size())
-                                        .sense(egui::Sense::click()),
-                                )
-                                .on_hover_cursor(egui::CursorIcon::PointingHand);
-                            if art_resp.clicked() {
-                                self.now_playing_flyout_open = !self.now_playing_flyout_open;
-                            }
-                        } else {
-                            let (rect, art_resp) = ui.allocate_exact_size(
-                                thumb.size(),
-                                egui::Sense::click(),
+                        if let Some(url) = &state.artwork_url {
+                            ui.add(
+                                egui::Image::new(url)
+                                    .corner_radius(4_u8)
+                                    .fit_to_exact_size(thumb.size()),
                             );
+                        } else {
+                            let (rect, _) =
+                                ui.allocate_exact_size(thumb.size(), egui::Sense::hover());
                             ui.painter().rect_filled(
                                 rect,
                                 4.0,
                                 egui::Color32::from_rgb(40, 40, 40),
                             );
-                            let art_resp =
-                                art_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-                            if art_resp.clicked() {
-                                self.now_playing_flyout_open = !self.now_playing_flyout_open;
-                            }
                         }
                     });
 
                     let text_rect = egui::Rect::from_min_max(
-                        egui::pos2(text_col_left, left_rect.top()),
-                        egui::pos2(text_col_right, left_rect.bottom()),
+                        egui::pos2(text_left, left_rect.top()),
+                        egui::pos2(left_rect.right() - 8.0, left_rect.bottom()),
                     );
                     if text_rect.width() >= 8.0 && text_rect.height() >= 8.0 {
-                        let (title_px, artist_px) = if hide_now_playing_bar_chip {
-                            (
-                                egui::lerp(15.0..=19.0, morph_e),
-                                egui::lerp(13.0..=17.0, morph_e),
-                            )
-                        } else {
-                            (14.0, 12.0)
-                        };
                         ui.allocate_ui_at_rect(text_rect, |ui| {
                             ui.with_layout(
                                 egui::Layout::top_down(egui::Align::Min),
                                 |ui| {
-                                    ui.add_space(text_top_pad);
+                                    ui.add_space(10.0);
                                     if state.track_name.is_empty() {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new("No track playing")
-                                                    .color(egui::Color32::WHITE)
-                                                    .size(title_px)
-                                                    .strong(),
-                                            )
-                                            .wrap(),
+                                        ui.label(
+                                            egui::RichText::new("No track playing")
+                                                .color(egui::Color32::WHITE)
+                                                .strong(),
                                         );
                                     } else {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(&state.track_name)
-                                                    .color(egui::Color32::WHITE)
-                                                    .size(title_px)
-                                                    .strong(),
-                                            )
-                                            .wrap(),
+                                        ui.label(
+                                            egui::RichText::new(&state.track_name)
+                                                .color(egui::Color32::WHITE)
+                                                .strong(),
                                         );
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(&state.artist_name)
-                                                    .color(egui::Color32::from_rgb(179, 179, 179))
-                                                    .size(artist_px),
-                                            )
-                                            .truncate(),
+                                        ui.label(
+                                            egui::RichText::new(&state.artist_name)
+                                                .color(egui::Color32::from_rgb(179, 179, 179))
+                                                .size(12.0),
                                         );
                                     }
                                 },
@@ -1336,7 +1254,7 @@ impl eframe::App for OnyxApp {
             bottom: 16,
         };
 
-        let sidebar_panel = egui::SidePanel::left("sidebar")
+        let _ = egui::SidePanel::left("sidebar")
             .resizable(true)
             .default_width(280.0)
             .width_range(200.0..=400.0)
@@ -1572,7 +1490,6 @@ impl eframe::App for OnyxApp {
                         }
                     });
             });
-        self.last_sidebar_rect = Some(sidebar_panel.response.rect);
 
         // CENTRAL PANEL (#121212)
         let mut central_frame = egui::Frame::default();
@@ -1615,97 +1532,10 @@ impl eframe::App for OnyxApp {
                     MainView::Dashboard => self.render_dashboard_view(ui),
                 }
             });
-
-        self.render_now_playing_morph(ctx, &state, now_playing_morph_t);
     }
 }
 
 impl OnyxApp {
-    fn render_now_playing_morph(
-        &mut self,
-        ctx: &egui::Context,
-        state: &PlaybackState,
-        e: f32,
-    ) {
-        if !self.now_playing_flyout_open && e < 1e-4 {
-            return;
-        }
-
-        const BOTTOM_BAR_H: f32 = 80.0;
-        const SEAM_OVERLAP_PX: f32 = 0.0;
-        let content = ctx.content_rect();
-        let bar_top = content.bottom() - BOTTOM_BAR_H;
-
-        let Some(sidebar) = self.last_sidebar_rect else {
-            return;
-        };
-
-        let left_strip = self.last_bottom_bar_left_rect.unwrap_or_else(|| {
-            let w_left = (content.width() * 0.3).round();
-            egui::Rect::from_min_max(
-                egui::pos2(content.left(), bar_top),
-                egui::pos2(content.left() + w_left, content.bottom()),
-            )
-        });
-
-        let thumb = bottom_bar_thumb_rect(&left_strip);
-
-        let sidebar_w = sidebar.width().max(1.0);
-        let art_side = sidebar_w;
-        let art_expanded_screen = egui::Rect::from_min_max(
-            egui::pos2(sidebar.left(), bar_top + SEAM_OVERLAP_PX - art_side),
-            egui::pos2(sidebar.right(), bar_top + SEAM_OVERLAP_PX),
-        );
-        let art_screen = thumb.lerp_towards(&art_expanded_screen, e);
-
-        if art_screen.width() < 2.0 || art_screen.height() < 2.0 {
-            return;
-        }
-
-        egui::Area::new(egui::Id::new("now_playing_morph_panel"))
-            .order(egui::Order::Foreground)
-            .movable(false)
-            .fixed_pos(art_screen.min)
-            .default_size(art_screen.size())
-            .show(ctx, |ui| {
-                ui.set_clip_rect(art_screen.expand(1.0));
-
-                let img_rect = art_screen.shrink(1.0);
-                if img_rect.width() >= 2.0 && img_rect.height() >= 2.0 {
-                    ui.allocate_ui_at_rect(img_rect, |ui| {
-                        let sz = img_rect.size();
-                        if let Some(url) = &state.artwork_url {
-                            let r = ui.add(
-                                egui::Image::new(url)
-                                    .corner_radius(egui::CornerRadius::ZERO)
-                                    .fit_to_exact_size(sz)
-                                    .sense(egui::Sense::click()),
-                            );
-                            if r.clicked() && self.now_playing_flyout_open {
-                                self.now_playing_flyout_open = false;
-                            }
-                        } else {
-                            let (paint_r, r) = ui.allocate_exact_size(sz, egui::Sense::click());
-                            ui.painter().rect_filled(
-                                paint_r,
-                                egui::CornerRadius::ZERO,
-                                egui::Color32::from_rgb(40, 40, 40),
-                            );
-                            if r.clicked() && self.now_playing_flyout_open {
-                                self.now_playing_flyout_open = false;
-                            }
-                        }
-                    });
-                }
-                ui.painter().rect_stroke(
-                    art_screen,
-                    egui::CornerRadius::ZERO,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(72, 72, 72)),
-                    egui::StrokeKind::Middle,
-                );
-            });
-    }
-
     fn render_central_header(&mut self, ui: &mut egui::Ui) {
         ui.add_space(CENTRAL_CONTENT_INSET);
         let full_w = ui.available_width();
