@@ -97,6 +97,31 @@ enum RankingKind {
 const CENTRAL_CONTENT_INSET: f32 = 24.0;
 /// Listening stats 2×2 grid: equal row and column gutter (px).
 const STATS_GRID_GAP: f32 = 12.0;
+/// Spotify-style accent for sliders, toggles, and primary actions.
+const ACCENT_GREEN: egui::Color32 = egui::Color32::from_rgb(30, 215, 96);
+/// Maps linear slider position to `u16` volume with more usable range in the lower half of the bar.
+const VOLUME_SLIDER_EXP: f32 = 0.5;
+
+#[inline]
+fn volume_u16_to_slider_t(volume: u16) -> f32 {
+    if volume == 0 {
+        0.0
+    } else {
+        let n = volume as f32 / u16::MAX as f32;
+        n.powf(1.0 / VOLUME_SLIDER_EXP)
+    }
+}
+
+#[inline]
+fn volume_slider_t_to_u16(t: f32) -> u16 {
+    let t = t.clamp(0.0, 1.0);
+    if t <= 0.0 {
+        0
+    } else {
+        let curved = t.powf(VOLUME_SLIDER_EXP);
+        ((curved * u16::MAX as f32).round() as u32).min(u16::MAX as u32) as u16
+    }
+}
 
 #[derive(Clone, Copy)]
 struct TrackTableLayout {
@@ -232,6 +257,10 @@ pub struct OnyxApp {
     repeat: bool,
 
     now_playing_flyout_open: bool,
+    /// Latest `SidePanel::left` outer rect (screen space), for now-playing morph alignment.
+    last_sidebar_rect: Option<egui::Rect>,
+    /// Latest bottom-bar left strip rect (screen space), for thumbnail anchor.
+    last_bottom_bar_left_rect: Option<egui::Rect>,
 }
 
 impl OnyxApp {
@@ -408,6 +437,8 @@ impl OnyxApp {
             shuffle: false,
             repeat: false,
             now_playing_flyout_open: false,
+            last_sidebar_rect: None,
+            last_bottom_bar_left_rect: None,
         }
     }
 
@@ -672,6 +703,14 @@ impl OnyxApp {
     }
 }
 
+/// Bottom-bar left strip: 56×56 artwork anchor (matches layout in `OnyxApp::update`).
+fn bottom_bar_thumb_rect(left_strip: &egui::Rect) -> egui::Rect {
+    egui::Rect::from_center_size(
+        egui::pos2(left_strip.min.x + 8.0 + 28.0, left_strip.center().y),
+        egui::vec2(56.0, 56.0),
+    )
+}
+
 impl eframe::App for OnyxApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut state = self.playback_state.lock().unwrap().clone();
@@ -692,6 +731,16 @@ impl eframe::App for OnyxApp {
         } else if self.stats_refresh_due_at.is_some() {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
+
+        const NOW_PLAYING_MORPH_SEC: f32 = 0.42;
+        let now_playing_morph_t = ctx.animate_bool_with_time_and_easing(
+            egui::Id::new("now_playing_flyout_anim"),
+            self.now_playing_flyout_open,
+            NOW_PLAYING_MORPH_SEC,
+            egui::emath::easing::cubic_in_out,
+        );
+        let hide_now_playing_bar_chip =
+            self.now_playing_flyout_open || now_playing_morph_t > 1e-4;
 
         // BOTTOM BAR (#181818)
         let mut bottom_frame = egui::Frame::default();
@@ -723,14 +772,47 @@ impl eframe::App for OnyxApp {
 
                 // Left Section
                 ui.allocate_ui_at_rect(left_rect, |ui| {
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.add_space(8.0); // push track image right just enough to align with sidebar (8 + 8 = 16)
-                        if let Some(url) = &state.artwork_url {
+                    self.last_bottom_bar_left_rect = Some(left_rect);
+                    let thumb = bottom_bar_thumb_rect(&left_rect);
+                    let text_left_default = thumb.right() + 12.0;
+                    let morph_e = now_playing_morph_t.clamp(0.0, 1.0);
+                    let (text_col_left, text_col_right) = if hide_now_playing_bar_chip {
+                        let under_left = self
+                            .last_sidebar_rect
+                            .map(|s| s.left() + 16.0)
+                            .unwrap_or(text_left_default);
+                        let under_right = self
+                            .last_sidebar_rect
+                            .map(|s| (s.right() - 8.0).min(left_rect.right() - 8.0))
+                            .unwrap_or(left_rect.right() - 8.0);
+                        let under_right = under_right.max(under_left + 40.0);
+                        let start_right = left_rect.right() - 8.0;
+                        let left = egui::lerp(text_left_default..=under_left, morph_e);
+                        let mut right = egui::lerp(start_right..=under_right, morph_e);
+                        right = right.max(left + 48.0).min(left_rect.right() - 8.0);
+                        (left, right)
+                    } else {
+                        (text_left_default, left_rect.right() - 8.0)
+                    };
+                    let text_top_pad = if hide_now_playing_bar_chip {
+                        egui::lerp(10.0..=4.0, morph_e)
+                    } else {
+                        10.0
+                    };
+
+                    ui.allocate_ui_at_rect(thumb, |ui| {
+                        if hide_now_playing_bar_chip {
+                            let (_, r) =
+                                ui.allocate_exact_size(thumb.size(), egui::Sense::click());
+                            if r.clicked() {
+                                self.now_playing_flyout_open = !self.now_playing_flyout_open;
+                            }
+                        } else if let Some(url) = &state.artwork_url {
                             let art_resp = ui
                                 .add(
                                     egui::Image::new(url)
                                         .corner_radius(4_u8)
-                                        .fit_to_exact_size(egui::vec2(56.0, 56.0))
+                                        .fit_to_exact_size(thumb.size())
                                         .sense(egui::Sense::click()),
                                 )
                                 .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -739,7 +821,7 @@ impl eframe::App for OnyxApp {
                             }
                         } else {
                             let (rect, art_resp) = ui.allocate_exact_size(
-                                egui::vec2(56.0, 56.0),
+                                thumb.size(),
                                 egui::Sense::click(),
                             );
                             ui.painter().rect_filled(
@@ -753,30 +835,59 @@ impl eframe::App for OnyxApp {
                                 self.now_playing_flyout_open = !self.now_playing_flyout_open;
                             }
                         }
-
-                        ui.add_space(12.0);
-                        ui.vertical(|ui| {
-                            ui.add_space(10.0); // vertically align
-                            if state.track_name.is_empty() {
-                                ui.label(
-                                    egui::RichText::new("No track playing")
-                                        .color(egui::Color32::WHITE)
-                                        .strong(),
-                                );
-                            } else {
-                                ui.label(
-                                    egui::RichText::new(&state.track_name)
-                                        .color(egui::Color32::WHITE)
-                                        .strong(),
-                                );
-                                ui.label(
-                                    egui::RichText::new(&state.artist_name)
-                                        .color(egui::Color32::from_rgb(179, 179, 179))
-                                        .size(12.0),
-                                );
-                            }
-                        });
                     });
+
+                    let text_rect = egui::Rect::from_min_max(
+                        egui::pos2(text_col_left, left_rect.top()),
+                        egui::pos2(text_col_right, left_rect.bottom()),
+                    );
+                    if text_rect.width() >= 8.0 && text_rect.height() >= 8.0 {
+                        let (title_px, artist_px) = if hide_now_playing_bar_chip {
+                            (
+                                egui::lerp(15.0..=19.0, morph_e),
+                                egui::lerp(13.0..=17.0, morph_e),
+                            )
+                        } else {
+                            (14.0, 12.0)
+                        };
+                        ui.allocate_ui_at_rect(text_rect, |ui| {
+                            ui.with_layout(
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.add_space(text_top_pad);
+                                    if state.track_name.is_empty() {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new("No track playing")
+                                                    .color(egui::Color32::WHITE)
+                                                    .size(title_px)
+                                                    .strong(),
+                                            )
+                                            .wrap(),
+                                        );
+                                    } else {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&state.track_name)
+                                                    .color(egui::Color32::WHITE)
+                                                    .size(title_px)
+                                                    .strong(),
+                                            )
+                                            .wrap(),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&state.artist_name)
+                                                    .color(egui::Color32::from_rgb(179, 179, 179))
+                                                    .size(artist_px),
+                                            )
+                                            .truncate(),
+                                        );
+                                    }
+                                },
+                            );
+                        });
+                    }
                 });
 
                 // Center Section
@@ -801,7 +912,7 @@ impl eframe::App for OnyxApp {
                                 ui.spacing_mut().item_spacing.x = spacing;
 
                                 let shuffle_color = if self.shuffle {
-                                    egui::Color32::from_rgb(30, 215, 96)
+                                    ACCENT_GREEN
                                 } else {
                                     egui::Color32::from_rgb(179, 179, 179)
                                 };
@@ -815,6 +926,7 @@ impl eframe::App for OnyxApp {
                                         )
                                         .frame(false),
                                     )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                                     .clicked()
                                 {
                                     self.toggle_shuffle();
@@ -825,6 +937,7 @@ impl eframe::App for OnyxApp {
                                         egui::Button::new(egui::RichText::new("⏮").size(14.0))
                                             .frame(false),
                                     )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                                     .clicked()
                                 {
                                     self.play_previous();
@@ -857,12 +970,13 @@ impl eframe::App for OnyxApp {
                                         egui::Button::new(egui::RichText::new("⏭").size(14.0))
                                             .frame(false),
                                     )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                                     .clicked()
                                 {
                                     self.play_next();
                                 }
                                 let repeat_color = if self.repeat {
-                                    egui::Color32::from_rgb(30, 215, 96)
+                                    ACCENT_GREEN
                                 } else {
                                     egui::Color32::from_rgb(179, 179, 179)
                                 };
@@ -876,6 +990,7 @@ impl eframe::App for OnyxApp {
                                         )
                                         .frame(false),
                                     )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                                     .clicked()
                                 {
                                     self.repeat = !self.repeat;
@@ -915,14 +1030,30 @@ impl eframe::App for OnyxApp {
 
                                 ui.spacing_mut().item_spacing.x = 8.0;
 
-                                let (rect, resp) = ui.allocate_exact_size(
-                                    egui::vec2(pb_width, 4.0),
+                                let interact_h = 14.0;
+                                let bar_h = 4.0;
+                                let (track_interact_rect, seek_resp) = ui.allocate_exact_size(
+                                    egui::vec2(pb_width, interact_h),
                                     egui::Sense::click_and_drag(),
                                 );
-                                if resp.clicked() || resp.dragged() {
-                                    if let Some(pos) = resp.interact_pointer_pos() {
-                                        let x = (pos.x - rect.left()).clamp(0.0, pb_width);
-                                        let pct = x / pb_width;
+                                let seek_resp =
+                                    seek_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                                let bar_rect = egui::Rect::from_min_max(
+                                    egui::pos2(
+                                        track_interact_rect.left(),
+                                        track_interact_rect.center().y - bar_h * 0.5,
+                                    ),
+                                    egui::pos2(
+                                        track_interact_rect.right(),
+                                        track_interact_rect.center().y + bar_h * 0.5,
+                                    ),
+                                );
+                                let bar_w = bar_rect.width();
+
+                                if seek_resp.clicked() || seek_resp.dragged() {
+                                    if let Some(pos) = seek_resp.interact_pointer_pos() {
+                                        let x = (pos.x - bar_rect.left()).clamp(0.0, bar_w);
+                                        let pct = x / bar_w;
                                         let duration = state.duration_ms.max(1) as f32;
                                         let new_pos = (pct * duration) as u32;
                                         self.update_position_immediately(new_pos, state.is_playing);
@@ -931,21 +1062,73 @@ impl eframe::App for OnyxApp {
                                         });
                                     }
                                 }
-                                ui.painter().rect_filled(
-                                    rect,
-                                    2.0,
-                                    egui::Color32::from_rgb(83, 83, 83),
-                                );
-                                let mut filled_rect = rect;
+
                                 let pct = if state.duration_ms > 0 {
                                     (display_position_ms as f32 / state.duration_ms as f32)
                                         .clamp(0.0, 1.0)
                                 } else {
                                     0.0
                                 };
-                                filled_rect.set_width(pb_width * pct);
-                                ui.painter()
-                                    .rect_filled(filled_rect, 2.0, egui::Color32::WHITE);
+                                let play_x = bar_rect.left() + bar_w * pct;
+                                let p = ui.painter();
+                                let track_color = if seek_resp.hovered() {
+                                    lighten(egui::Color32::from_rgb(83, 83, 83), 22)
+                                } else {
+                                    egui::Color32::from_rgb(83, 83, 83)
+                                };
+                                p.rect_filled(bar_rect, 2.0, track_color);
+
+                                if seek_resp.hovered() {
+                                    if let Some(hover_pos) = seek_resp.hover_pos() {
+                                        let hx =
+                                            (hover_pos.x - bar_rect.left()).clamp(0.0, bar_w);
+                                        if hx > bar_w * pct {
+                                            let hover_x_abs = bar_rect.left() + hx;
+                                            let preview_r = egui::Rect::from_min_max(
+                                                egui::pos2(play_x, bar_rect.top()),
+                                                egui::pos2(hover_x_abs, bar_rect.bottom()),
+                                            );
+                                            p.rect_filled(
+                                                preview_r,
+                                                2.0,
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    200, 200, 200, 72,
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+
+                                let fill_color = if seek_resp.hovered() {
+                                    lighten(ACCENT_GREEN, 18)
+                                } else {
+                                    ACCENT_GREEN
+                                };
+                                if pct > 0.0 {
+                                    let mut fr = bar_rect;
+                                    fr.set_right(play_x.max(bar_rect.left() + 1.0));
+                                    p.rect_filled(fr, 2.0, fill_color);
+                                }
+
+                                if state.duration_ms > 0 {
+                                    p.circle_filled(
+                                        egui::pos2(play_x, bar_rect.center().y),
+                                        5.0,
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+
+                                if seek_resp.hovered() && state.duration_ms > 0 {
+                                    if let Some(hover_pos) = seek_resp.hover_pos() {
+                                        let hx =
+                                            (hover_pos.x - bar_rect.left()).clamp(0.0, bar_w);
+                                        let preview_ms = ((hx / bar_w) * state.duration_ms as f32)
+                                            as u32;
+                                        let _ = seek_resp.on_hover_text(format_duration(
+                                            preview_ms.min(state.duration_ms),
+                                        ));
+                                    }
+                                }
 
                                 let remaining = state
                                     .duration_ms
@@ -1001,15 +1184,31 @@ impl eframe::App for OnyxApp {
                         p.line_segment([m + egui::vec2(s, s - 4.0), m + egui::vec2(s, s)], stroke);
 
                         let vol_w = 80.0;
-                        let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(vol_w, 4.0),
+                        let interact_h = 14.0;
+                        let bar_h = 4.0;
+                        let (vol_track_interact, vol_resp) = ui.allocate_exact_size(
+                            egui::vec2(vol_w, interact_h),
                             egui::Sense::click_and_drag(),
                         );
-                        if response.dragged() || response.clicked() {
-                            if let Some(pos) = response.interact_pointer_pos() {
-                                let x = (pos.x - rect.left()).clamp(0.0, vol_w);
-                                let vol_pct = x / vol_w;
-                                let new_vol = (vol_pct * 65535.0) as u16;
+                        let vol_resp =
+                            vol_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        let vol_bar_rect = egui::Rect::from_min_max(
+                            egui::pos2(
+                                vol_track_interact.left(),
+                                vol_track_interact.center().y - bar_h * 0.5,
+                            ),
+                            egui::pos2(
+                                vol_track_interact.right(),
+                                vol_track_interact.center().y + bar_h * 0.5,
+                            ),
+                        );
+                        let vol_bar_w = vol_bar_rect.width();
+
+                        if vol_resp.dragged() || vol_resp.clicked() {
+                            if let Some(pos) = vol_resp.interact_pointer_pos() {
+                                let x = (pos.x - vol_bar_rect.left()).clamp(0.0, vol_bar_w);
+                                let t = x / vol_bar_w;
+                                let new_vol = volume_slider_t_to_u16(t);
                                 if new_vol != state.volume {
                                     state.volume = new_vol;
                                     if new_vol > 0 {
@@ -1020,12 +1219,30 @@ impl eframe::App for OnyxApp {
                             }
                         }
 
-                        ui.painter()
-                            .rect_filled(rect, 2.0, egui::Color32::from_rgb(83, 83, 83));
-                        let mut filled_rect = rect;
-                        filled_rect.set_width(vol_w * (state.volume as f32 / 65535.0));
-                        ui.painter()
-                            .rect_filled(filled_rect, 2.0, egui::Color32::WHITE);
+                        let vp = ui.painter();
+                        let vol_track_color = if vol_resp.hovered() {
+                            lighten(egui::Color32::from_rgb(83, 83, 83), 22)
+                        } else {
+                            egui::Color32::from_rgb(83, 83, 83)
+                        };
+                        vp.rect_filled(vol_bar_rect, 2.0, vol_track_color);
+                        let vol_fill_w = vol_bar_w * volume_u16_to_slider_t(state.volume);
+                        let vol_fill_color = if vol_resp.hovered() {
+                            lighten(ACCENT_GREEN, 18)
+                        } else {
+                            ACCENT_GREEN
+                        };
+                        if vol_fill_w > 0.0 {
+                            let mut fr = vol_bar_rect;
+                            fr.set_right(vol_bar_rect.left() + vol_fill_w);
+                            vp.rect_filled(fr, 2.0, vol_fill_color);
+                        }
+                        let knob_x = vol_bar_rect.left() + vol_fill_w;
+                        vp.circle_filled(
+                            egui::pos2(knob_x, vol_bar_rect.center().y),
+                            5.0,
+                            egui::Color32::WHITE,
+                        );
 
                         let (rect, resp) =
                             ui.allocate_exact_size(egui::vec2(btn_w, btn_w), egui::Sense::click());
@@ -1119,7 +1336,7 @@ impl eframe::App for OnyxApp {
             bottom: 16,
         };
 
-        egui::SidePanel::left("sidebar")
+        let sidebar_panel = egui::SidePanel::left("sidebar")
             .resizable(true)
             .default_width(280.0)
             .width_range(200.0..=400.0)
@@ -1355,6 +1572,7 @@ impl eframe::App for OnyxApp {
                         }
                     });
             });
+        self.last_sidebar_rect = Some(sidebar_panel.response.rect);
 
         // CENTRAL PANEL (#121212)
         let mut central_frame = egui::Frame::default();
@@ -1398,112 +1616,93 @@ impl eframe::App for OnyxApp {
                 }
             });
 
-        self.render_now_playing_flyout(ctx, &state);
+        self.render_now_playing_morph(ctx, &state, now_playing_morph_t);
     }
 }
 
 impl OnyxApp {
-    fn render_now_playing_flyout(&mut self, ctx: &egui::Context, state: &PlaybackState) {
-        const FLYOUT_ANIM_SEC: f32 = 0.38;
-        const BOTTOM_BAR_H: f32 = 80.0;
-        const EDGE_MARGIN: f32 = 16.0;
-        const GAP_ABOVE_BAR: f32 = 10.0;
-        const SLIDE_SLOP: f32 = 28.0;
-        const FLYOUT_W: f32 = 280.0;
-        const ART: f32 = 232.0;
-        const PAD: f32 = 20.0;
-        const TEXT_BLOCK_H: f32 = 76.0;
-        let panel_h = PAD + ART + 16.0 + TEXT_BLOCK_H + PAD;
-
-        let t = ctx.animate_bool_with_time_and_easing(
-            egui::Id::new("now_playing_flyout_anim"),
-            self.now_playing_flyout_open,
-            FLYOUT_ANIM_SEC,
-            egui::emath::easing::cubic_in_out,
-        );
-
-        if !self.now_playing_flyout_open && t < 1e-4 {
+    fn render_now_playing_morph(
+        &mut self,
+        ctx: &egui::Context,
+        state: &PlaybackState,
+        e: f32,
+    ) {
+        if !self.now_playing_flyout_open && e < 1e-4 {
             return;
         }
 
-        let screen = ctx.content_rect();
-        let rest_x = screen.left() + EDGE_MARGIN;
-        let slide = (1.0 - t) * (FLYOUT_W + SLIDE_SLOP);
-        let x = rest_x - slide;
-        let y = screen.bottom() - BOTTOM_BAR_H - GAP_ABOVE_BAR - panel_h;
+        const BOTTOM_BAR_H: f32 = 80.0;
+        const SEAM_OVERLAP_PX: f32 = 0.0;
+        let content = ctx.content_rect();
+        let bar_top = content.bottom() - BOTTOM_BAR_H;
 
-        egui::Area::new(egui::Id::new("now_playing_flyout_panel"))
+        let Some(sidebar) = self.last_sidebar_rect else {
+            return;
+        };
+
+        let left_strip = self.last_bottom_bar_left_rect.unwrap_or_else(|| {
+            let w_left = (content.width() * 0.3).round();
+            egui::Rect::from_min_max(
+                egui::pos2(content.left(), bar_top),
+                egui::pos2(content.left() + w_left, content.bottom()),
+            )
+        });
+
+        let thumb = bottom_bar_thumb_rect(&left_strip);
+
+        let sidebar_w = sidebar.width().max(1.0);
+        let art_side = sidebar_w;
+        let art_expanded_screen = egui::Rect::from_min_max(
+            egui::pos2(sidebar.left(), bar_top + SEAM_OVERLAP_PX - art_side),
+            egui::pos2(sidebar.right(), bar_top + SEAM_OVERLAP_PX),
+        );
+        let art_screen = thumb.lerp_towards(&art_expanded_screen, e);
+
+        if art_screen.width() < 2.0 || art_screen.height() < 2.0 {
+            return;
+        }
+
+        egui::Area::new(egui::Id::new("now_playing_morph_panel"))
             .order(egui::Order::Foreground)
             .movable(false)
-            .fixed_pos(egui::pos2(x, y))
+            .fixed_pos(art_screen.min)
+            .default_size(art_screen.size())
             .show(ctx, |ui| {
-                // One opacity for frame background, artwork, and text (avoids background fading first).
-                ui.set_opacity(t.clamp(0.0, 1.0));
+                ui.set_clip_rect(art_screen.expand(1.0));
 
-                egui::Frame::default()
-                    .fill(egui::Color32::from_rgb(31, 31, 31))
-                    .corner_radius(12.0)
-                    .inner_margin(egui::Margin::same(PAD as i8))
-                    .show(ui, |ui| {
-                        ui.set_width(FLYOUT_W - 2.0 * PAD);
-
+                let img_rect = art_screen.shrink(1.0);
+                if img_rect.width() >= 2.0 && img_rect.height() >= 2.0 {
+                    ui.allocate_ui_at_rect(img_rect, |ui| {
+                        let sz = img_rect.size();
                         if let Some(url) = &state.artwork_url {
-                            ui.add(
+                            let r = ui.add(
                                 egui::Image::new(url)
-                                    .corner_radius(8_u8)
-                                    .fit_to_exact_size(egui::vec2(ART, ART)),
+                                    .corner_radius(egui::CornerRadius::ZERO)
+                                    .fit_to_exact_size(sz)
+                                    .sense(egui::Sense::click()),
                             );
+                            if r.clicked() && self.now_playing_flyout_open {
+                                self.now_playing_flyout_open = false;
+                            }
                         } else {
-                            let (r, _) = ui.allocate_exact_size(
-                                egui::vec2(ART, ART),
-                                egui::Sense::hover(),
+                            let (paint_r, r) = ui.allocate_exact_size(sz, egui::Sense::click());
+                            ui.painter().rect_filled(
+                                paint_r,
+                                egui::CornerRadius::ZERO,
+                                egui::Color32::from_rgb(40, 40, 40),
                             );
-                            ui.painter()
-                                .rect_filled(r, 8.0, egui::Color32::from_rgb(40, 40, 40));
-                        }
-
-                        ui.add_space(14.0);
-
-                        if state.track_name.is_empty() {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new("No track playing")
-                                        .color(egui::Color32::WHITE)
-                                        .size(17.0)
-                                        .strong(),
-                                )
-                                .wrap(),
-                            );
-                            ui.add_space(4.0);
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new("—")
-                                        .color(egui::Color32::from_rgb(179, 179, 179))
-                                        .size(14.0),
-                                )
-                                .wrap(),
-                            );
-                        } else {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&state.track_name)
-                                        .color(egui::Color32::WHITE)
-                                        .size(17.0)
-                                        .strong(),
-                                )
-                                .wrap(),
-                            );
-                            ui.add_space(6.0);
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&state.artist_name)
-                                        .color(egui::Color32::from_rgb(179, 179, 179))
-                                        .size(14.0),
-                                )
-                                .wrap(),
-                            );
+                            if r.clicked() && self.now_playing_flyout_open {
+                                self.now_playing_flyout_open = false;
+                            }
                         }
                     });
+                }
+                ui.painter().rect_stroke(
+                    art_screen,
+                    egui::CornerRadius::ZERO,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(72, 72, 72)),
+                    egui::StrokeKind::Middle,
+                );
             });
     }
 
@@ -1636,7 +1835,7 @@ impl OnyxApp {
             }
 
             let shuffle_color = if self.shuffle {
-                egui::Color32::from_rgb(30, 215, 96)
+                ACCENT_GREEN
             } else {
                 egui::Color32::from_rgb(179, 179, 179)
             };
@@ -1645,6 +1844,7 @@ impl OnyxApp {
                     egui::Button::new(egui::RichText::new("🔀").size(20.0).color(shuffle_color))
                         .frame(false),
                 )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked()
             {
                 self.toggle_shuffle();
@@ -1893,8 +2093,11 @@ impl OnyxApp {
                     ui.add_space(12.0);
                     if ui
                         .add(
-                            egui::Button::new("Open Settings")
-                                .fill(egui::Color32::from_rgb(30, 215, 96)),
+                            egui::Button::new(
+                                egui::RichText::new("Open Settings")
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(ACCENT_GREEN),
                         )
                         .clicked()
                     {
@@ -2174,8 +2377,10 @@ impl OnyxApp {
         ui.horizontal(|ui| {
             if ui
                 .add(
-                    egui::Button::new("Import Spotify ZIP")
-                        .fill(egui::Color32::from_rgb(30, 215, 96)),
+                    egui::Button::new(
+                        egui::RichText::new("Import Spotify ZIP").color(egui::Color32::WHITE),
+                    )
+                    .fill(ACCENT_GREEN),
                 )
                 .clicked()
             {
@@ -2250,8 +2455,10 @@ impl OnyxApp {
             ui.horizontal(|ui| {
                 if ui
                     .add(
-                        egui::Button::new("Save API Keys")
-                            .fill(egui::Color32::from_rgb(30, 215, 96)),
+                        egui::Button::new(
+                            egui::RichText::new("Save API Keys").color(egui::Color32::WHITE),
+                        )
+                        .fill(ACCENT_GREEN),
                     )
                     .clicked()
                 {
@@ -3682,11 +3889,15 @@ fn range_mode_button(
     label: &str,
 ) -> bool {
     let selected = *value == option;
-    let button = egui::Button::new(label).fill(if selected {
-        egui::Color32::from_rgb(30, 215, 96)
+    let (fill, text_color) = if selected {
+        (ACCENT_GREEN, egui::Color32::WHITE)
     } else {
-        egui::Color32::from_rgb(38, 38, 38)
-    });
+        (
+            egui::Color32::from_rgb(38, 38, 38),
+            egui::Color32::from_rgb(179, 179, 179),
+        )
+    };
+    let button = egui::Button::new(egui::RichText::new(label).color(text_color)).fill(fill);
     if ui.add(button).clicked() {
         let changed = *value != option;
         *value = option;
