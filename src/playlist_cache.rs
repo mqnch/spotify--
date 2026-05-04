@@ -106,6 +106,9 @@ impl PlaylistCache {
                 [],
             )
             .ok();
+        self.conn
+            .execute("ALTER TABLE playlist_tracks ADD COLUMN artist_id TEXT", [])
+            .ok();
 
         Ok(())
     }
@@ -133,7 +136,7 @@ impl PlaylistCache {
             .map(|value| value.with_timezone(&Utc));
 
         let mut stmt = self.conn.prepare(
-            "SELECT position, name, artist, album, album_image_url, album_thumbnail_url, added_at, duration_ms, spotify_uri
+            "SELECT position, name, artist, album, album_image_url, album_thumbnail_url, added_at, duration_ms, spotify_uri, artist_id
              FROM playlist_tracks
              WHERE playlist_id = ?1
              ORDER BY position ASC",
@@ -150,6 +153,7 @@ impl PlaylistCache {
                 added_at: row.get(6)?,
                 duration_ms: row.get::<_, i64>(7)? as u32,
                 spotify_uri: row.get(8)?,
+                artist_id: row.get(9)?,
             })
         })?;
 
@@ -301,8 +305,8 @@ impl PlaylistCache {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO playlist_tracks
-                    (playlist_id, position, name, artist, album, album_image_url, album_thumbnail_url, added_at, duration_ms, spotify_uri)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    (playlist_id, position, name, artist, album, album_image_url, album_thumbnail_url, added_at, duration_ms, spotify_uri, artist_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(playlist_id, position) DO UPDATE SET
                     name = excluded.name,
                     artist = excluded.artist,
@@ -311,7 +315,8 @@ impl PlaylistCache {
                     album_thumbnail_url = excluded.album_thumbnail_url,
                     added_at = excluded.added_at,
                     duration_ms = excluded.duration_ms,
-                    spotify_uri = excluded.spotify_uri",
+                    spotify_uri = excluded.spotify_uri,
+                    artist_id = excluded.artist_id",
             )?;
 
             for track in tracks {
@@ -326,6 +331,7 @@ impl PlaylistCache {
                     track.added_at,
                     track.duration_ms,
                     track.spotify_uri,
+                    track.artist_id,
                 ])?;
             }
         }

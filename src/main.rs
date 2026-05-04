@@ -1,4 +1,5 @@
 mod app_settings;
+mod artist_cache;
 mod auth;
 mod config;
 mod downloads;
@@ -8,17 +9,25 @@ mod metadata;
 mod player;
 mod playlist_cache;
 mod spotify_api;
+mod spotify_token_store;
 mod telemetry;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use librespot::playback::player::PlayerEvent;
 use rspotify::prelude::*;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+async fn spotify_access_token(spotify: &rspotify::AuthCodeSpotify) -> Option<String> {
+    auth::access_token(spotify).await
+}
+
 fn main() -> Result<()> {
-    // Initialize logger (set RUST_LOG=info or debug for more output).
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("onyx=info")).init();
+    // Default: onyx at info; librespot at warn so load/decode/sink errors are visible (they are easy to miss with `onyx=info` alone).
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
+        "onyx=info,librespot_core=warn,librespot_playback=warn,librespot_metadata=warn",
+    ))
+    .init();
 
     println!();
     println!("  ╔═══════════════════════════╗");
@@ -34,31 +43,57 @@ fn main() -> Result<()> {
         println!("  ONYX_CACHE_ONLY=1: Spotify Web API and audio session startup are disabled.");
     }
 
-    let (spotify, audio, db, playback_state, app_config, user_settings) = rt.block_on(async {
+    let (spotify_opt, audio, db, playback_state, app_config, user_settings) = rt.block_on(async {
         // ── Step 1: Ensure API keys are configured ───────────────────────
         let app_config = config::AppConfig::ensure_configured()?;
         let user_settings = app_settings::UserSettings::load();
 
-        // ── Step 2: Authenticate with Spotify Web API (rspotify) ─────────
-        let spotify = auth::authenticate(&app_config).await?;
-
-        // Verify: print the authenticated user.
-        if cache_only {
-            println!("  Logged in as: cached user (offline UI mode)");
+        // ── Step 2: Restore Spotify Web API session from keyring (optional) ─
+        let spotify_opt: Option<rspotify::AuthCodeSpotify> = if cache_only {
+            match auth::restore_spotify_session(&app_config).await? {
+                Some(s) => Some(s),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "ONYX_CACHE_ONLY=1 requires a valid Spotify token in the keyring"
+                    ));
+                }
+            }
         } else {
-            let user = spotify.current_user().await?;
-            println!(
-                "  Logged in as: {}",
-                user.display_name.as_deref().unwrap_or("(unknown)")
-            );
+            auth::restore_spotify_session(&app_config).await?
+        };
+
+        if let Some(ref sp) = spotify_opt {
+            if cache_only {
+                println!("  Logged in as: cached user (offline UI mode)");
+            } else {
+                let user = sp.current_user().await?;
+                println!(
+                    "  Logged in as: {}",
+                    user.display_name.as_deref().unwrap_or("(unknown)")
+                );
+            }
+        } else if !cache_only {
+            println!("  Spotify: not signed in — use Connect to Spotify in the app window.");
         }
 
-        // ── Step 3: Start the audio engine (librespot) ───────────────────
+        // ── Step 3: Audio engine (librespot) ─────────────────────────────
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PlayerEvent>();
+
+        let warm = Arc::new(player::AudioWarmState {
+            event_tx: event_tx.clone(),
+            equalizer: Arc::new(Mutex::new(user_settings.equalizer.clone())),
+            client_id: app_config.spotify_client_id.clone(),
+        });
+
         let audio = if cache_only {
-            player::AudioEngine::offline()
+            player::AudioEngine::offline(Arc::clone(&warm))
+        } else if let Some(ref sp) = spotify_opt {
+            let token = spotify_access_token(sp).await;
+            player::AudioEngine::start_live(Arc::clone(&warm), token)
+                .await
+                .context("Failed to start audio engine")?
         } else {
-            player::AudioEngine::start(event_tx, user_settings.equalizer.clone()).await?
+            player::AudioEngine::offline(Arc::clone(&warm))
         };
 
         // ── Step 4: Event listener (Telemetry Engine) ────────────────────
@@ -67,7 +102,9 @@ fn main() -> Result<()> {
 
         let db_clone = Arc::clone(&db);
         let state_clone = Arc::clone(&playback_state);
-        let spotify_clone = spotify.clone();
+        let spotify_for_events = spotify_opt.clone();
+        let audio_for_reconnect = audio.clone();
+        let reconnect_busy = Arc::new(Mutex::new(false));
 
         tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
@@ -109,6 +146,10 @@ fn main() -> Result<()> {
                         if cache_only {
                             continue;
                         }
+
+                        let Some(ref spotify_clone) = spotify_for_events else {
+                            continue;
+                        };
 
                         // Phase 4: Scrobble logic
                         let id_str = track_id.to_base62().unwrap_or_default();
@@ -164,18 +205,69 @@ fn main() -> Result<()> {
                             st.position_ms = 0;
                             st.position_anchor_ms = 0;
                             st.position_updated_at = Some(std::time::Instant::now());
+                            st.duration_ms = audio_item.duration_ms;
                         }
                         log::info!(
                             "🎵 Track changed → {} - {}",
                             audio_item.track_id,
                             audio_item.name
                         );
+
+                        if cache_only {
+                            continue;
+                        }
+                        let Some(ref spotify_meta) = spotify_for_events else {
+                            continue;
+                        };
+                        let id_str = audio_item.track_id.to_base62().unwrap_or_default();
+                        if id_str.is_empty() {
+                            continue;
+                        }
+                        let spotify = spotify_meta.clone();
+                        let state_meta = state_clone.clone();
+                        tokio::spawn(async move {
+                            let Ok(tid) = rspotify::model::TrackId::from_id(id_str.as_str()) else {
+                                return;
+                            };
+                            match spotify.track(tid, None).await {
+                                Ok(track_obj) => {
+                                    let artist_name = track_obj
+                                        .artists
+                                        .first()
+                                        .map(|a| a.name.clone())
+                                        .unwrap_or_default();
+                                    let artist_id = track_obj
+                                        .artists
+                                        .first()
+                                        .and_then(|a| a.id.as_ref())
+                                        .map(|id| id.to_string());
+                                    let (artwork_url, _) =
+                                        crate::spotify_api::full_track_artwork_urls(&track_obj);
+                                    if let Ok(mut st) = state_meta.lock() {
+                                        st.artist_name = artist_name;
+                                        st.artist_id = artist_id;
+                                        st.artwork_url = artwork_url;
+                                        st.spotify_uri =
+                                            track_obj.id.as_ref().map(|id| id.uri());
+                                        st.duration_ms =
+                                            track_obj.duration.num_milliseconds() as u32;
+                                    }
+                                }
+                                Err(e) => {
+                                    log::debug!(
+                                        "Web API track metadata after TrackChanged failed: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        });
                     }
                     PlayerEvent::Stopped { .. } => {
                         if let Ok(mut st) = state_clone.lock() {
                             st.is_playing = false;
                             st.track_name.clear();
                             st.artist_name.clear();
+                            st.artist_id = None;
                             st.artwork_url = None;
                             st.spotify_uri = None;
                             st.position_ms = 0;
@@ -185,6 +277,84 @@ fn main() -> Result<()> {
                         }
                         log::info!("⏹ Stopped");
                     }
+                    PlayerEvent::Loading {
+                        track_id,
+                        position_ms,
+                        ..
+                    } => {
+                        log::info!(
+                            "Loading track {:?} (start position {} ms)",
+                            track_id,
+                            position_ms
+                        );
+                    }
+                    PlayerEvent::Unavailable { track_id, .. } => {
+                        if let Ok(mut st) = state_clone.lock() {
+                            st.is_playing = false;
+                            st.position_updated_at = None;
+                        }
+                        // librespot loads tracks via Spotify's internal extended-metadata API; HTTP 400
+                        // often came from using a custom Session `client_id` (must stay librespot default).
+                        // Other causes: Premium, regional restrictions, or Developer app access.
+                        log::warn!(
+                            "Track unavailable: {:?}. If this persists, confirm Spotify Premium, try \
+                             another track, and check RUST_LOG=librespot_core=debug for SpClient errors.",
+                            track_id
+                        );
+                    }
+                    PlayerEvent::SessionDisconnected { .. } if !cache_only => {
+                        let Some(ref sp) = spotify_for_events else {
+                            continue;
+                        };
+                        {
+                            let mut g = reconnect_busy.lock().unwrap();
+                            if *g {
+                                continue;
+                            }
+                            *g = true;
+                        }
+                        log::warn!(
+                            "librespot session disconnected; attempting one reconnect with refreshed token"
+                        );
+                        let sp = sp.clone();
+                        let audio = audio_for_reconnect.clone();
+                        let busy = Arc::clone(&reconnect_busy);
+                        let state_for_vol = state_clone.clone();
+                        tokio::spawn(async move {
+                            struct BusyReset(Arc<Mutex<bool>>);
+                            impl Drop for BusyReset {
+                                fn drop(&mut self) {
+                                    if let Ok(mut g) = self.0.lock() {
+                                        *g = false;
+                                    }
+                                }
+                            }
+                            let _busy_guard = BusyReset(busy);
+
+                            if let Err(e) = sp.refresh_token().await {
+                                log::error!("Token refresh before audio reconnect failed: {}", e);
+                                return;
+                            }
+                            let Some(tok) = spotify_access_token(&sp).await else {
+                                log::error!("No access token after refresh for audio reconnect");
+                                return;
+                            };
+                            match audio.reconnect_live_session(&tok).await {
+                                Ok(()) => {
+                                    let vol = state_for_vol
+                                        .lock()
+                                        .map(|g| g.volume)
+                                        .unwrap_or(u16::MAX);
+                                    if let Err(e) =
+                                        audio.send(player::AudioCmd::SetVolume { volume_u16: vol })
+                                    {
+                                        log::warn!("Volume sync after reconnect failed: {}", e);
+                                    }
+                                }
+                                Err(e) => log::error!("librespot reconnect failed: {}", e),
+                            }
+                        });
+                    }
                     _ => {
                         log::debug!("Player event: {:?}", event);
                     }
@@ -192,12 +362,9 @@ fn main() -> Result<()> {
             }
         });
 
-        // // ── Step 5: Demo — Hybrid Metadata Pipeline ──────────────────────
-        // demo_metadata_pipeline(&app_config, &spotify, &audio).await?;
-
         Ok::<
             (
-                rspotify::AuthCodeSpotify,
+                Option<rspotify::AuthCodeSpotify>,
                 player::AudioHandle,
                 Arc<Mutex<telemetry::TelemetryDb>>,
                 Arc<Mutex<gui::PlaybackState>>,
@@ -206,7 +373,7 @@ fn main() -> Result<()> {
             ),
             anyhow::Error,
         >((
-            spotify,
+            spotify_opt,
             audio,
             db,
             playback_state,
@@ -215,7 +382,7 @@ fn main() -> Result<()> {
         ))
     })?;
 
-    let audio_cmd_tx = audio.cmd_tx.clone();
+    let audio_handle = audio.clone();
 
     // ── Step 6: GUI Construction (egui) ─────────────────────────────
     let native_options = eframe::NativeOptions {
@@ -236,8 +403,8 @@ fn main() -> Result<()> {
             Ok(Box::new(gui::OnyxApp::new(
                 cc,
                 rt_handle,
-                spotify.clone(),
-                audio_cmd_tx,
+                spotify_opt.clone(),
+                audio_handle.clone(),
                 playback_state.clone(),
                 db.clone(),
                 app_config.clone(),
@@ -247,7 +414,7 @@ fn main() -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {}", e))?;
 
-    audio.cmd_tx.send(player::AudioCmd::Shutdown)?;
+    let _ = audio.send(player::AudioCmd::Shutdown);
     println!("\n  Goodbye.");
 
     Ok(())
@@ -343,7 +510,7 @@ async fn demo_metadata_pipeline(
         println!();
         println!("  ▶ Playing first resolved track…");
         println!("  (Press Ctrl+C to stop)");
-        audio.cmd_tx.send(player::AudioCmd::Load {
+        audio.send(player::AudioCmd::Load {
             uri,
             start_playing: true,
             position_ms: 0,

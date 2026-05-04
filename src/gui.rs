@@ -1,16 +1,18 @@
 use crate::app_settings::{EQ_BANDS, EqualizerSettings, PlaylistOrderingSettings, UserSettings};
 use crate::config::AppConfig;
 use crate::downloads::{DOWNLOAD_DOWNLOADED, DOWNLOAD_DOWNLOADING, DownloadStatuses};
-use crate::player::AudioCmd;
-use crate::spotify_api::{PlaylistSummary, PlaylistTrack};
+use crate::player::{AudioCmd, AudioHandle};
+use crate::spotify_api::{
+    ArtistAlbumSummary, ArtistProfile, PlaylistSummary, PlaylistTrack, artist_queue_playlist_id,
+};
 use crate::telemetry::{ListeningStats, RankedItem, StatsDateRange, StatsMetric, TelemetryDb};
-use chrono::{Datelike, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use eframe::egui;
+use egui::text::{LayoutJob, TextFormat};
 use rspotify::AuthCodeSpotify;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
 #[derive(Clone)]
@@ -18,6 +20,7 @@ pub struct PlaybackState {
     pub is_playing: bool,
     pub track_name: String,
     pub artist_name: String,
+    pub artist_id: Option<String>,
     pub artwork_url: Option<String>,
     pub spotify_uri: Option<String>,
     pub position_ms: u32,
@@ -34,6 +37,7 @@ impl Default for PlaybackState {
             is_playing: false,
             track_name: String::new(),
             artist_name: String::new(),
+            artist_id: None,
             artwork_url: None,
             spotify_uri: None,
             position_ms: 0,
@@ -66,10 +70,50 @@ struct PlaylistLoadState {
     complete: bool,
 }
 
+#[derive(Clone)]
+enum ArtistPageStatus {
+    Idle,
+    Loading,
+    Loaded,
+    Error(String),
+}
+
+#[derive(Clone)]
+struct ArtistLoadState {
+    artist_id: Option<String>,
+    generation: u64,
+    name_hint: String,
+    profile: Option<ArtistProfile>,
+    popular_tracks: Vec<PlaylistTrack>,
+    albums: Vec<ArtistAlbumSummary>,
+    status: ArtistPageStatus,
+    /// When set (e.g. Last.fm), shown instead of Spotify follower formatting.
+    listener_display: Option<String>,
+    /// Show up to 10 popular rows instead of 5.
+    popular_show_all: bool,
+}
+
+impl Default for ArtistLoadState {
+    fn default() -> Self {
+        Self {
+            artist_id: None,
+            generation: 0,
+            name_hint: String::new(),
+            profile: None,
+            popular_tracks: Vec::new(),
+            albums: Vec::new(),
+            status: ArtistPageStatus::Idle,
+            listener_display: None,
+            popular_show_all: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MainView {
     Dashboard,
     Playlist,
+    Artist,
     Settings,
 }
 
@@ -101,6 +145,10 @@ const STATS_GRID_GAP: f32 = 12.0;
 const ACCENT_GREEN: egui::Color32 = egui::Color32::from_rgb(30, 215, 96);
 /// Maps linear slider position to `u16` volume with more usable range in the lower half of the bar.
 const VOLUME_SLIDER_EXP: f32 = 0.5;
+/// Slider-space step for keyboard volume (↑ / ↓).
+const VOLUME_KEYBOARD_STEP_T: f32 = 0.06;
+/// Two arrow key presses within this window trigger previous/next track.
+const ARROW_DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(400);
 
 #[inline]
 fn volume_u16_to_slider_t(volume: u16) -> f32 {
@@ -120,6 +168,27 @@ fn volume_slider_t_to_u16(t: f32) -> u16 {
     } else {
         let curved = t.powf(VOLUME_SLIDER_EXP);
         ((curved * u16::MAX as f32).round() as u32).min(u16::MAX as u32) as u16
+    }
+}
+
+#[inline]
+fn volume_step_slider(volume: u16, delta_t: f32) -> u16 {
+    let t = volume_u16_to_slider_t(volume) + delta_t;
+    volume_slider_t_to_u16(t)
+}
+
+fn consume_arrow_double_tap(last: &mut Option<Instant>, key_pressed: bool) -> bool {
+    if !key_pressed {
+        return false;
+    }
+    let now = Instant::now();
+    let trigger = last.is_some_and(|t| now.duration_since(t) <= ARROW_DOUBLE_TAP_WINDOW);
+    if trigger {
+        *last = None;
+        true
+    } else {
+        *last = Some(now);
+        false
     }
 }
 
@@ -207,13 +276,33 @@ struct TrackTableRects {
     duration: egui::Rect,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrackSortColumn {
+    Index,
+    Title,
+    Album,
+    DateAdded,
+    Duration,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrackSortDirection {
+    Asc,
+    Desc,
+}
+
 const MAX_RECENT_PLAYLISTS: usize = 50;
 
 pub struct OnyxApp {
-    pub spotify: AuthCodeSpotify,
-    pub audio_cmd_tx: UnboundedSender<AudioCmd>,
+    pub spotify: Option<AuthCodeSpotify>,
+    pub audio_handle: AudioHandle,
     pub playback_state: Arc<Mutex<PlaybackState>>,
     pub db: Arc<Mutex<TelemetryDb>>,
+
+    /// OAuth / playlist fetch from the Connect UI (None until completed).
+    spotify_connect_result: Arc<Mutex<Option<Result<AuthCodeSpotify, String>>>>,
+    spotify_login_busy: bool,
+    spotify_login_error: Option<String>,
 
     listening_stats: ListeningStats,
     stats_status: Option<String>,
@@ -251,18 +340,29 @@ pub struct OnyxApp {
     stats_refresh_due_at: Option<Instant>,
     last_sent_volume: u16,
     previous_volume: u16,
+    arrow_left_last_tap: Option<Instant>,
+    arrow_right_last_tap: Option<Instant>,
 
     // Playback state toggles
     shuffle: bool,
     repeat: bool,
+
+    /// None = preserve API / playlist order for this view.
+    track_sort: Option<(TrackSortColumn, TrackSortDirection)>,
+
+    artist_state: Arc<Mutex<ArtistLoadState>>,
+    artist_generation: u64,
+    artist_task: Option<JoinHandle<()>>,
+    /// Original track order for the current queue (before shuffle), for restoring when shuffle is toggled off.
+    queue_original_tracks: Vec<PlaylistTrack>,
 }
 
 impl OnyxApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         rt: tokio::runtime::Handle,
-        spotify: AuthCodeSpotify,
-        audio_cmd_tx: UnboundedSender<AudioCmd>,
+        spotify: Option<AuthCodeSpotify>,
+        audio_handle: AudioHandle,
         playback_state: Arc<Mutex<PlaybackState>>,
         db: Arc<Mutex<TelemetryDb>>,
         app_config: AppConfig,
@@ -274,7 +374,7 @@ impl OnyxApp {
         visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::from_rgb(179, 179, 179); // Gray text
         visuals.selection.bg_fill = egui::Color32::from_rgb(30, 215, 96); // Spotify Green
         cc.egui_ctx.set_visuals(visuals);
-        install_manrope_font(&cc.egui_ctx);
+        configure_ui_fonts(&cc.egui_ctx);
 
         let current_year = Utc::now().year();
         let current_month = Utc::now().month();
@@ -300,17 +400,25 @@ impl OnyxApp {
             }
         };
 
-        let cached_playlists = crate::playlist_cache::PlaylistCache::new()
+        let mut cached_playlists = crate::playlist_cache::PlaylistCache::new()
             .and_then(|cache| cache.load_playlists())
             .unwrap_or_else(|e| {
                 log::warn!("Failed to load cached playlists: {}", e);
                 Vec::new()
             });
+        if !cached_playlists
+            .iter()
+            .any(|p| crate::spotify_api::is_liked_songs_playlist(&p.id))
+        {
+            cached_playlists.insert(0, crate::spotify_api::liked_songs_summary(0));
+        }
         let cache_only = crate::spotify_api::cache_only_mode();
         let playlists_status_text = if cache_only && cached_playlists.is_empty() {
             "Cache-only mode: no cached playlists yet.".to_string()
         } else if cache_only {
             "Cache-only mode: Spotify API disabled.".to_string()
+        } else if spotify.is_none() {
+            "Sign in to Spotify to load your library.".to_string()
         } else if cached_playlists.is_empty() {
             "Loading playlists...".to_string()
         } else {
@@ -334,15 +442,23 @@ impl OnyxApp {
         ));
         let playlists_clone = playlists.clone();
         let playlists_status_clone = playlists_status.clone();
-        let spotify_clone = spotify.clone();
         let ctx_clone = cc.egui_ctx.clone();
 
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
         if !cache_only {
-            rt.spawn(async move {
+            if let Some(spotify_clone) = spotify.clone() {
+                rt.spawn(async move {
                 match crate::spotify_api::user_playlists(&spotify_clone).await {
-                    Ok(pl) => {
+                    Ok(mut pl) => {
+                        let liked_total =
+                            crate::spotify_api::user_saved_tracks_total(&spotify_clone)
+                                .await
+                                .unwrap_or_else(|e| {
+                                    log::warn!("Failed to fetch liked songs count: {}", e);
+                                    0
+                                });
+                        pl.insert(0, crate::spotify_api::liked_songs_summary(liked_total));
                         let count = pl.len();
                         if let Ok(cache) = crate::playlist_cache::PlaylistCache::new() {
                             for playlist in &pl {
@@ -387,11 +503,15 @@ impl OnyxApp {
                 }
                 ctx_clone.request_repaint();
             });
+            }
         }
 
         Self {
             spotify,
-            audio_cmd_tx,
+            audio_handle,
+            spotify_connect_result: Arc::new(Mutex::new(None)),
+            spotify_login_busy: false,
+            spotify_login_error: None,
             playback_state,
             db,
             listening_stats,
@@ -428,9 +548,360 @@ impl OnyxApp {
             stats_refresh_due_at: None,
             last_sent_volume: u16::MAX,
             previous_volume: u16::MAX,
+            arrow_left_last_tap: None,
+            arrow_right_last_tap: None,
             shuffle: false,
             repeat: false,
+            track_sort: None,
+            artist_state: Arc::new(Mutex::new(ArtistLoadState::default())),
+            artist_generation: 0,
+            artist_task: None,
+            queue_original_tracks: Vec::new(),
         }
+    }
+
+    fn poll_spotify_connect_result(&mut self, ctx: &egui::Context) {
+        let taken = self
+            .spotify_connect_result
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take());
+        let Some(result) = taken else {
+            return;
+        };
+        self.spotify_login_busy = false;
+        match result {
+            Ok(client) => {
+                self.spotify = Some(client.clone());
+                self.spotify_login_error = None;
+                self.spawn_playlist_refresh(&client, ctx);
+                let audio = self.audio_handle.clone();
+                let ctx2 = ctx.clone();
+                let client2 = client.clone();
+                self.rt.spawn(async move {
+                    if let Some(tok) = crate::auth::access_token(&client2).await {
+                        if let Err(e) = audio.reconnect_live_session(&tok).await {
+                            log::error!("Live audio after Spotify login failed: {}", e);
+                        }
+                    }
+                    ctx2.request_repaint();
+                });
+            }
+            Err(e) => {
+                self.spotify_login_error = Some(e);
+            }
+        }
+    }
+
+    fn spawn_playlist_refresh(&self, spotify: &AuthCodeSpotify, ctx: &egui::Context) {
+        let spotify_clone = spotify.clone();
+        let playlists_clone = self.playlists.clone();
+        let playlists_status_clone = self.playlists_status.clone();
+        let ctx_clone = ctx.clone();
+        self.rt.spawn(async move {
+            match crate::spotify_api::user_playlists(&spotify_clone).await {
+                Ok(mut pl) => {
+                    let liked_total = crate::spotify_api::user_saved_tracks_total(&spotify_clone)
+                        .await
+                        .unwrap_or_else(|e| {
+                            log::warn!("Failed to fetch liked songs count: {}", e);
+                            0
+                        });
+                    pl.insert(0, crate::spotify_api::liked_songs_summary(liked_total));
+                    let count = pl.len();
+                    if let Ok(cache) = crate::playlist_cache::PlaylistCache::new() {
+                        for playlist in &pl {
+                            if let Err(e) = cache.save_playlist(playlist, false) {
+                                log::warn!("Failed to cache playlist metadata: {}", e);
+                            }
+                        }
+                    }
+                    if let Ok(mut lock) = playlists_clone.lock() {
+                        *lock = pl;
+                    }
+                    if let Ok(mut status) = playlists_status_clone.lock() {
+                        if count == 0 {
+                            *status = "No playlists found.".to_string();
+                        } else {
+                            status.clear();
+                        }
+                    }
+                    log::info!("Loaded {} playlists", count);
+                }
+                Err(e) => {
+                    log::error!("Failed to fetch user playlists: {:#}", e);
+                    let rate_limit_message = crate::spotify_api::rate_limit_status_message(&e);
+                    let cached_count = playlists_clone
+                        .lock()
+                        .map(|playlists| playlists.len())
+                        .unwrap_or_default();
+                    if let Ok(mut status) = playlists_status_clone.lock() {
+                        *status = if let Some(message) = rate_limit_message {
+                            if cached_count > 0 {
+                                format!("Showing cached playlists. {}", message)
+                            } else {
+                                message
+                            }
+                        } else if cached_count > 0 {
+                            format!("Showing cached playlists. Spotify request failed: {:#}", e)
+                        } else {
+                            format!("Failed to load playlists: {:#}", e)
+                        };
+                    }
+                }
+            }
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn render_spotify_connect_gate(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(80.0);
+            ui.heading(
+                egui::RichText::new("Connect to Spotify")
+                    .color(egui::Color32::WHITE)
+                    .size(22.0),
+            );
+            ui.add_space(16.0);
+            ui.label(
+                egui::RichText::new(
+                    "Your saved session is missing or was revoked. Sign in again — your API keys stay in the system keyring.",
+                )
+                .color(egui::Color32::from_rgb(179, 179, 179))
+                .size(14.0),
+            );
+            if let Some(err) = &self.spotify_login_error {
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(err)
+                        .color(egui::Color32::from_rgb(255, 120, 120))
+                        .size(13.0),
+                );
+            }
+            ui.add_space(28.0);
+            let can_click = !self.spotify_login_busy;
+            if ui
+                .add_enabled(
+                    can_click,
+                    egui::Button::new(egui::RichText::new("Sign in with Spotify").size(15.0)),
+                )
+                .clicked()
+            {
+                self.spotify_login_busy = true;
+                self.spotify_login_error = None;
+                let pending = self.spotify_connect_result.clone();
+                let cfg = self.app_config.clone();
+                self.rt.spawn(async move {
+                    let spotify = crate::auth::create_spotify_client(&cfg);
+                    let out = match crate::auth::authenticate_interactive(&spotify).await {
+                        Ok(()) => Ok(spotify),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    if let Ok(mut g) = pending.lock() {
+                        *g = Some(out);
+                    }
+                });
+            }
+            if self.spotify_login_busy {
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("Complete login in your browser…")
+                            .color(egui::Color32::from_rgb(179, 179, 179)),
+                    );
+                });
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn artist_color_cache_key(artist_id: &str) -> String {
+        let id = artist_id.split(':').last().unwrap_or(artist_id);
+        format!("artist:{id}")
+    }
+
+    fn open_artist_page(&mut self, artist_id: String, name_hint: String, ctx: &egui::Context) {
+        if let Some(t) = self.artist_task.take() {
+            t.abort();
+        }
+        self.artist_generation += 1;
+        let generation = self.artist_generation;
+        self.main_view = MainView::Artist;
+        self.track_sort = None;
+
+        let id_clean = artist_id
+            .split(':')
+            .last()
+            .unwrap_or(artist_id.as_str())
+            .to_string();
+
+        if let Ok(mut s) = self.artist_state.lock() {
+            s.artist_id = Some(id_clean.clone());
+            s.generation = generation;
+            s.name_hint = name_hint;
+            s.profile = None;
+            s.popular_tracks.clear();
+            s.albums.clear();
+            s.listener_display = None;
+            s.popular_show_all = false;
+            s.status = ArtistPageStatus::Loading;
+        }
+
+        let cache_only = crate::spotify_api::cache_only_mode();
+        if cache_only {
+            if let Ok(mut s) = self.artist_state.lock() {
+                if s.generation == generation {
+                    s.status = ArtistPageStatus::Error(
+                        "Cache-only mode: artist pages need the Spotify API.".to_string(),
+                    );
+                }
+            }
+            ctx.request_repaint();
+            return;
+        }
+
+        let Some(spotify) = self.spotify.clone() else {
+            if let Ok(mut s) = self.artist_state.lock() {
+                if s.generation == generation {
+                    s.status = ArtistPageStatus::Error(
+                        "Sign in to Spotify to load this artist.".to_string(),
+                    );
+                }
+            }
+            ctx.request_repaint();
+            return;
+        };
+
+        if let Ok(cache) = crate::artist_cache::ArtistCache::new() {
+            if let Ok(Some(page)) = cache.load(id_clean.as_str()) {
+                let fresh = crate::artist_cache::is_fresh(&page);
+                if let Ok(mut s) = self.artist_state.lock() {
+                    if s.generation == generation {
+                        s.profile = Some(page.profile.clone());
+                        s.popular_tracks = page.popular_tracks.clone();
+                        s.albums = page.albums.clone();
+                        s.listener_display = page.listener_display.clone();
+                        s.popular_show_all = false;
+                        s.status = ArtistPageStatus::Loaded;
+                    }
+                }
+                ctx.request_repaint();
+                if fresh {
+                    return;
+                }
+            }
+        }
+
+        let state = self.artist_state.clone();
+        let ctx2 = ctx.clone();
+        let aid = id_clean.clone();
+        let lastfm_key = self.app_config.lastfm_api_key.trim().to_string();
+        self.artist_task = Some(self.rt.spawn(async move {
+            let profile = match crate::spotify_api::fetch_artist_profile(&spotify, &aid).await {
+                Ok(p) => p,
+                Err(e) => {
+                    if let Ok(mut lock) = state.lock() {
+                        if lock.generation == generation {
+                            lock.status = ArtistPageStatus::Error(e.to_string());
+                        }
+                    }
+                    ctx2.request_repaint();
+                    return;
+                }
+            };
+
+            let listener_display = if profile.followers == 0 && !lastfm_key.is_empty() {
+                let lf = crate::lastfm::LastFmClient::new(&lastfm_key);
+                lf.artist_info(&profile.name)
+                    .await
+                    .ok()
+                    .and_then(|i| crate::lastfm::format_listener_line(&i))
+            } else {
+                None
+            };
+
+            let market = crate::spotify_api::catalog_market(&spotify).await;
+
+            let (popular, albums) = if !lastfm_key.is_empty() {
+                let lf = crate::lastfm::LastFmClient::new(&lastfm_key);
+                let top = match lf.artist_top_tracks(&profile.name, 10).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log::warn!("Last.fm artist top tracks: {e:#}");
+                        Vec::new()
+                    }
+                };
+                let pairs: Vec<(String, String)> = top
+                    .iter()
+                    .map(|t| (t.artist.name.clone(), t.name.clone()))
+                    .collect();
+                let matcher = crate::metadata::IdMatcher::new(spotify.clone());
+                let resolved = matcher.resolve_batch(pairs).await;
+                let pop_fut = crate::spotify_api::popular_tracks_from_resolved(
+                    &spotify,
+                    resolved,
+                    &aid,
+                    Some(market),
+                );
+                let alb_fut = crate::spotify_api::fetch_artist_albums(&spotify, &aid, market);
+                let (popular_r, albums_r) = tokio::join!(pop_fut, alb_fut);
+                let popular = popular_r.unwrap_or_else(|e| {
+                    log::warn!("Enrich Last.fm popular tracks: {e:#}");
+                    Vec::new()
+                });
+                let albums = albums_r.unwrap_or_else(|e| {
+                    log::warn!("Artist albums: {e:#}");
+                    Vec::new()
+                });
+                (popular, albums)
+            } else {
+                let popular =
+                    match crate::spotify_api::fetch_artist_top_tracks(&spotify, &aid, market).await
+                    {
+                        Ok(tr) => tr,
+                        Err(e) => {
+                            log::warn!("Artist top tracks: {e:#}");
+                            Vec::new()
+                        }
+                    };
+                let albums =
+                    match crate::spotify_api::fetch_artist_albums(&spotify, &aid, market).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            log::warn!("Artist albums: {e:#}");
+                            Vec::new()
+                        }
+                    };
+                (popular, albums)
+            };
+
+            if let Ok(mut lock) = state.lock() {
+                if lock.generation != generation {
+                    return;
+                }
+                lock.profile = Some(profile.clone());
+                lock.popular_tracks = popular.clone();
+                lock.albums = albums.clone();
+                lock.listener_display = listener_display.clone();
+                lock.status = ArtistPageStatus::Loaded;
+            }
+
+            let page = crate::artist_cache::CachedArtistPage::with_timestamp(
+                profile,
+                popular,
+                albums,
+                listener_display,
+            );
+            if let Ok(mut c) = crate::artist_cache::ArtistCache::new() {
+                if let Err(e) = c.save(&aid, &page) {
+                    log::debug!("artist cache save: {e:#}");
+                }
+            }
+
+            ctx2.request_repaint();
+        }));
+        ctx.request_repaint();
     }
 
     fn select_playlist(&mut self, playlist: PlaylistSummary, ctx: &egui::Context) {
@@ -444,6 +915,8 @@ impl OnyxApp {
             return;
         }
 
+        self.track_sort = None;
+
         if let Some(task) = self.playlist_task.take() {
             task.abort();
         }
@@ -454,18 +927,28 @@ impl OnyxApp {
         self.main_view = MainView::Playlist;
         self.ensure_playlist_color(&playlist, ctx);
         let cache_only = crate::spotify_api::cache_only_mode();
+        let is_liked = crate::spotify_api::is_liked_songs_playlist(&playlist.id);
 
         let cached_tracks = crate::playlist_cache::PlaylistCache::new()
             .ok()
             .and_then(|cache| cache.load_tracks(&playlist.id).ok().flatten());
         let can_use_cache_without_refresh = cached_tracks.as_ref().is_some_and(|cached| {
-            cached.complete
-                && !cached.tracks.is_empty()
-                && (cache_only
-                    || cached.snapshot_id.is_some()
-                        && playlist.snapshot_id.is_some()
-                        && cached.snapshot_id == playlist.snapshot_id
-                    || crate::playlist_cache::PlaylistCache::cache_is_fresh(cached.fetched_at))
+            if !cached.complete || cached.tracks.is_empty() {
+                return false;
+            }
+            if cache_only {
+                return true;
+            }
+            if cached.tracks.iter().any(|t| t.artist_id.is_none()) {
+                return false;
+            }
+            if is_liked {
+                return crate::playlist_cache::PlaylistCache::cache_is_fresh(cached.fetched_at);
+            }
+            (cached.snapshot_id.is_some()
+                && playlist.snapshot_id.is_some()
+                && cached.snapshot_id == playlist.snapshot_id)
+                || crate::playlist_cache::PlaylistCache::cache_is_fresh(cached.fetched_at)
         });
 
         if let Ok(mut state) = self.playlist_state.lock() {
@@ -494,10 +977,88 @@ impl OnyxApp {
             return;
         }
 
-        let spotify = self.spotify.clone();
+        let Some(spotify) = self.spotify.clone() else {
+            if let Ok(mut state) = self.playlist_state.lock() {
+                if state.generation == generation {
+                    state.status = PlaylistStatus::Error(
+                        "Sign in to Spotify to load this playlist.".to_string(),
+                    );
+                }
+            }
+            ctx.request_repaint();
+            return;
+        };
+
         let state = self.playlist_state.clone();
         let ctx = ctx.clone();
         let playlist_id = playlist.id.clone();
+        let playlist_for_cache = playlist.clone();
+
+        if is_liked {
+            self.playlist_task = Some(self.rt.spawn(async move {
+                let mut cache = match crate::playlist_cache::PlaylistCache::new() {
+                    Ok(cache) => Some(cache),
+                    Err(e) => {
+                        log::warn!("Playlist cache unavailable: {}", e);
+                        None
+                    }
+                };
+
+                if let Some(cache) = cache.as_ref() {
+                    if let Err(e) = cache.save_playlist(&playlist_for_cache, false) {
+                        log::warn!("Failed to save playlist cache metadata: {}", e);
+                    }
+                }
+
+                let fetch_result = crate::spotify_api::user_saved_tracks(&spotify).await;
+
+                match fetch_result {
+                    Ok(tracks) => {
+                        if let Some(cache) = cache.as_mut() {
+                            if let Err(e) = cache.save_track_batch(&playlist_id, &tracks) {
+                                log::warn!("Failed to cache liked tracks: {}", e);
+                            }
+                            if let Err(e) = cache.finish_refresh(&playlist_for_cache, tracks.len()) {
+                                log::warn!("Failed to finalize liked songs cache: {}", e);
+                            }
+                        }
+
+                        if let Ok(mut lock) = state.lock() {
+                            if lock.generation == generation
+                                && lock.playlist_id.as_deref() == Some(playlist_id.as_str())
+                            {
+                                lock.tracks = tracks;
+                                lock.status = PlaylistStatus::Loaded;
+                                lock.complete = true;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to fetch liked songs: {:#}", e);
+                        let rate_limit_message = crate::spotify_api::rate_limit_status_message(&e);
+                        if let Ok(mut lock) = state.lock() {
+                            if lock.generation == generation
+                                && lock.playlist_id.as_deref() == Some(playlist_id.as_str())
+                            {
+                                lock.status = if let Some(message) = rate_limit_message {
+                                    let prefix = if lock.tracks.is_empty() {
+                                        "Spotify rate limited track loading."
+                                    } else {
+                                        "Using cached tracks."
+                                    };
+                                    PlaylistStatus::RateLimited(format!("{} {}", prefix, message))
+                                } else {
+                                    PlaylistStatus::Error(e.to_string())
+                                };
+                            }
+                        }
+                    }
+                }
+
+                ctx.request_repaint();
+            }));
+            return;
+        }
 
         self.playlist_task = Some(self.rt.spawn(async move {
             let mut cache = match crate::playlist_cache::PlaylistCache::new() {
@@ -509,7 +1070,7 @@ impl OnyxApp {
             };
 
             if let Some(cache) = cache.as_ref() {
-                if let Err(e) = cache.save_playlist(&playlist, false) {
+                if let Err(e) = cache.save_playlist(&playlist_for_cache, false) {
                     log::warn!("Failed to save playlist cache metadata: {}", e);
                 }
             }
@@ -553,7 +1114,7 @@ impl OnyxApp {
             match fetch_result {
                 Ok(tracks) => {
                     if let Some(cache) = cache.as_ref() {
-                        if let Err(e) = cache.finish_refresh(&playlist, tracks.len()) {
+                        if let Err(e) = cache.finish_refresh(&playlist_for_cache, tracks.len()) {
                             log::warn!("Failed to finalize playlist cache: {}", e);
                         }
                     }
@@ -595,33 +1156,48 @@ impl OnyxApp {
     }
 
     fn ensure_playlist_color(&mut self, playlist: &PlaylistSummary, ctx: &egui::Context) {
-        let Some(url) = playlist
+        let fallback = if crate::spotify_api::is_liked_songs_playlist(&playlist.id) {
+            Some([105, 95, 245])
+        } else {
+            None
+        };
+        let url = playlist
             .image_url
             .clone()
-            .or_else(|| playlist.thumbnail_url.clone())
-        else {
+            .or_else(|| playlist.thumbnail_url.clone());
+        self.ensure_color_from_cover_url(playlist.id.clone(), url, fallback, ctx);
+    }
+
+    /// Sample a header gradient color from cover art (used for playlists and artist pages).
+    fn ensure_color_from_cover_url(
+        &mut self,
+        cache_key: String,
+        url: Option<String>,
+        no_image_fallback: Option<[u8; 3]>,
+        ctx: &egui::Context,
+    ) {
+        let Some(url) = url else {
             if let Ok(mut colors) = self.playlist_colors.lock() {
-                colors.entry(playlist.id.clone()).or_insert(None);
+                colors.entry(cache_key).or_insert(no_image_fallback);
             }
             return;
         };
 
         if let Ok(mut colors) = self.playlist_colors.lock() {
-            if colors.contains_key(&playlist.id) {
+            if colors.contains_key(&cache_key) {
                 return;
             }
-            colors.insert(playlist.id.clone(), None);
+            colors.insert(cache_key.clone(), None);
         } else {
             return;
         }
 
-        let playlist_id = playlist.id.clone();
         let colors = self.playlist_colors.clone();
         let ctx = ctx.clone();
         self.rt.spawn(async move {
             let color = fetch_playlist_color(url).await;
             if let Ok(mut colors) = colors.lock() {
-                colors.insert(playlist_id, color);
+                colors.insert(cache_key, color);
             }
             ctx.request_repaint();
         });
@@ -702,13 +1278,85 @@ fn bottom_bar_thumb_rect(left_strip: &egui::Rect) -> egui::Rect {
     )
 }
 
+impl OnyxApp {
+    fn handle_playback_keyboard_shortcuts(
+        &mut self,
+        ctx: &egui::Context,
+        state: &PlaybackState,
+        display_position_ms: u32,
+    ) {
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+
+        let plain_modifiers = ctx.input(|i| {
+            !i.modifiers.alt && !i.modifiers.ctrl && !i.modifiers.command
+        });
+        if !plain_modifiers {
+            return;
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            if state.is_playing {
+                self.update_position_immediately(display_position_ms, false);
+                let _ = self.audio_handle.send(AudioCmd::Pause);
+            } else {
+                self.update_position_immediately(display_position_ms, true);
+                let _ = self.audio_handle.send(AudioCmd::Play);
+            }
+            return;
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+            let new_vol = volume_step_slider(state.volume, VOLUME_KEYBOARD_STEP_T);
+            if new_vol != state.volume {
+                if new_vol > 0 {
+                    self.previous_volume = new_vol;
+                }
+                self.set_volume_immediately(new_vol, true);
+            }
+            return;
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+            let new_vol = volume_step_slider(state.volume, -VOLUME_KEYBOARD_STEP_T);
+            if new_vol != state.volume {
+                if new_vol == 0 {
+                    self.previous_volume = state.volume;
+                } else {
+                    self.previous_volume = new_vol;
+                }
+                self.set_volume_immediately(new_vol, true);
+            }
+            return;
+        }
+
+        let left_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
+        if consume_arrow_double_tap(&mut self.arrow_left_last_tap, left_pressed) {
+            self.play_previous();
+            return;
+        }
+
+        let right_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
+        if consume_arrow_double_tap(&mut self.arrow_right_last_tap, right_pressed) {
+            self.play_next();
+        }
+    }
+}
+
 impl eframe::App for OnyxApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_spotify_connect_result(ctx);
+        if self.spotify_login_busy {
+            ctx.request_repaint();
+        }
         let mut state = self.playback_state.lock().unwrap().clone();
         self.advance_queue_after_track_end(&state);
         self.flush_pending_queue_load();
         state = self.playback_state.lock().unwrap().clone();
         let display_position_ms = display_position_ms(&state);
+
+        self.handle_playback_keyboard_shortcuts(ctx, &state, display_position_ms);
 
         if state.is_playing {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -796,11 +1444,70 @@ impl eframe::App for OnyxApp {
                                                 .color(egui::Color32::WHITE)
                                                 .strong(),
                                         );
-                                        ui.label(
-                                            egui::RichText::new(&state.artist_name)
-                                                .color(egui::Color32::from_rgb(179, 179, 179))
-                                                .size(12.0),
+                                        let artist_h = 16.0_f32;
+                                        let artist_top = ui.min_rect().bottom() + 2.0;
+                                        let artist_rect = egui::Rect::from_min_max(
+                                            egui::pos2(text_rect.left(), artist_top),
+                                            egui::pos2(text_rect.right(), artist_top + artist_h),
                                         );
+                                        if let Some(aid) = state.artist_id.as_deref() {
+                                            let np_artist_id =
+                                                ui.id().with(("np_artist", aid, &state.artist_name));
+                                            let artist_interact = ui.interact(
+                                                artist_rect,
+                                                np_artist_id,
+                                                egui::Sense::click(),
+                                            );
+                                            let muted = egui::Color32::from_rgb(179, 179, 179);
+                                            let hover_c = egui::Color32::from_rgb(230, 230, 230);
+                                            let c = if artist_interact.hovered() {
+                                                hover_c
+                                            } else {
+                                                muted
+                                            };
+                                            if artist_interact.hovered() {
+                                                ui.ctx()
+                                                    .set_cursor_icon(egui::CursorIcon::PointingHand);
+                                            }
+                                            let text = elide_to_width(
+                                                &state.artist_name,
+                                                artist_rect.width(),
+                                                12.0,
+                                            );
+                                            let font_id = egui::FontId::proportional(12.0);
+                                            let galley = ui.painter().layout_no_wrap(
+                                                text,
+                                                font_id,
+                                                c,
+                                            );
+                                            let pos = egui::pos2(
+                                                artist_rect.left(),
+                                                artist_rect.center().y - 12.0 * 0.55,
+                                            );
+                                            ui.painter().galley(pos, galley, c);
+                                            if artist_interact.clicked() {
+                                                self.open_artist_page(
+                                                    aid.to_string(),
+                                                    state.artist_name.clone(),
+                                                    ctx,
+                                                );
+                                            }
+                                        } else {
+                                            ui.allocate_ui_at_rect(artist_rect, |ui| {
+                                                ui.set_width(artist_rect.width());
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(&state.artist_name)
+                                                            .color(egui::Color32::from_rgb(
+                                                                179, 179, 179,
+                                                            ))
+                                                            .size(12.0),
+                                                    )
+                                                    .truncate()
+                                                    .selectable(false),
+                                                );
+                                            });
+                                        }
                                     }
                                 },
                             );
@@ -849,15 +1556,8 @@ impl eframe::App for OnyxApp {
                                 {
                                     self.toggle_shuffle();
                                 }
-                                if ui
-                                    .add_sized(
-                                        [btn_w, btn_w],
-                                        egui::Button::new(egui::RichText::new("⏮").size(14.0))
-                                            .frame(false),
-                                    )
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                    .clicked()
-                                {
+                                let skip_color = egui::Color32::from_rgb(179, 179, 179);
+                                if track_skip_button(ui, btn_w, false, skip_color).clicked() {
                                     self.play_previous();
                                 }
 
@@ -875,22 +1575,14 @@ impl eframe::App for OnyxApp {
                                             display_position_ms,
                                             false,
                                         );
-                                        let _ = self.audio_cmd_tx.send(AudioCmd::Pause);
+                                        let _ = self.audio_handle.send(AudioCmd::Pause);
                                     } else {
                                         self.update_position_immediately(display_position_ms, true);
-                                        let _ = self.audio_cmd_tx.send(AudioCmd::Play);
+                                        let _ = self.audio_handle.send(AudioCmd::Play);
                                     }
                                 }
 
-                                if ui
-                                    .add_sized(
-                                        [btn_w, btn_w],
-                                        egui::Button::new(egui::RichText::new("⏭").size(14.0))
-                                            .frame(false),
-                                    )
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                    .clicked()
-                                {
+                                if track_skip_button(ui, btn_w, true, skip_color).clicked() {
                                     self.play_next();
                                 }
                                 let repeat_color = if self.repeat {
@@ -975,7 +1667,7 @@ impl eframe::App for OnyxApp {
                                         let duration = state.duration_ms.max(1) as f32;
                                         let new_pos = (pct * duration) as u32;
                                         self.update_position_immediately(new_pos, state.is_playing);
-                                        let _ = self.audio_cmd_tx.send(AudioCmd::Seek {
+                                        let _ = self.audio_handle.send(AudioCmd::Seek {
                                             position_ms: new_pos,
                                         });
                                     }
@@ -1435,7 +2127,9 @@ impl eframe::App for OnyxApp {
                                 rect.min + egui::vec2(0.0, 3.0),
                                 egui::vec2(48.0, 48.0),
                             );
-                            if let Some(url) = p.thumbnail_url.as_ref().or(p.image_url.as_ref()) {
+                            if crate::spotify_api::is_liked_songs_playlist(&p.id) {
+                                paint_liked_songs_playlist_artwork(ui.painter(), img_rect, 4.0);
+                            } else if let Some(url) = p.thumbnail_url.as_ref().or(p.image_url.as_ref()) {
                                 ui.put(
                                     img_rect,
                                     egui::Image::new(url)
@@ -1471,11 +2165,21 @@ impl eframe::App for OnyxApp {
                                 ),
                             );
                             paint_left_text(ui, name_rect, &p.name, name_color, 13.0, true);
-                            let meta_text = if let Some(status_text) = status_text {
-                                format!("Playlist • {} tracks • {}", p.track_count, status_text)
-                            } else {
-                                format!("Playlist • {} tracks", p.track_count)
-                            };
+                            let meta_text =
+                                if crate::spotify_api::is_liked_songs_playlist(&p.id) {
+                                    if let Some(status_text) = status_text {
+                                        format!(
+                                            "Playlist • {} liked songs • {}",
+                                            p.track_count, status_text
+                                        )
+                                    } else {
+                                        format!("Playlist • {} liked songs", p.track_count)
+                                    }
+                                } else if let Some(status_text) = status_text {
+                                    format!("Playlist • {} tracks • {}", p.track_count, status_text)
+                                } else {
+                                    format!("Playlist • {} tracks", p.track_count)
+                                };
                             paint_left_text(
                                 ui,
                                 meta_rect,
@@ -1501,6 +2205,11 @@ impl eframe::App for OnyxApp {
         egui::CentralPanel::default()
             .frame(central_frame)
             .show(ctx, |ui| {
+                let cache_only = crate::spotify_api::cache_only_mode();
+                if !cache_only && self.spotify.is_none() {
+                    self.render_spotify_connect_gate(ui, ctx);
+                    return;
+                }
                 if self.main_view == MainView::Playlist {
                     if let Some(playlist) = self.selected_playlist.clone() {
                         self.ensure_playlist_color(&playlist, ctx);
@@ -1511,6 +2220,27 @@ impl eframe::App for OnyxApp {
                             .and_then(|colors| colors.get(&playlist.id).copied().flatten())
                             .map(playlist_gradient_color);
                         paint_playlist_header_gradient(ui, playlist_color);
+                    }
+                } else if self.main_view == MainView::Artist {
+                    let artist_snapshot = self.artist_state.lock().unwrap().clone();
+                    if let Some(ref profile) = artist_snapshot.profile {
+                        let key = Self::artist_color_cache_key(&profile.id);
+                        self.ensure_color_from_cover_url(
+                            key.clone(),
+                            profile
+                                .image_url
+                                .clone()
+                                .or_else(|| profile.thumbnail_url.clone()),
+                            None,
+                            ctx,
+                        );
+                        let artist_color = self
+                            .playlist_colors
+                            .lock()
+                            .ok()
+                            .and_then(|colors| colors.get(&key).copied().flatten())
+                            .map(playlist_gradient_color);
+                        paint_playlist_header_gradient(ui, artist_color);
                     }
                 }
 
@@ -1524,10 +2254,15 @@ impl eframe::App for OnyxApp {
                             self.render_central_header(ui);
                             let playlist_state = self.playlist_state.lock().unwrap().clone();
                             self.maybe_run_pending_autoplay(&playlist_state);
-                            self.render_playlist_view(ui, &playlist, &playlist_state, &state);
+                            self.render_playlist_view(ui, &playlist, &playlist_state, &state, ctx);
                         } else {
                             self.render_dashboard_view(ui);
                         }
+                    }
+                    MainView::Artist => {
+                        self.render_central_header(ui);
+                        let artist_snapshot = self.artist_state.lock().unwrap().clone();
+                        self.render_artist_view(ui, &artist_snapshot, &state, ctx);
                     }
                     MainView::Dashboard => self.render_dashboard_view(ui),
                 }
@@ -1562,10 +2297,16 @@ impl OnyxApp {
         playlist: &PlaylistSummary,
         playlist_state: &PlaylistLoadState,
         playback_state: &PlaybackState,
+        ctx: &egui::Context,
     ) {
         self.ensure_playlist_color(playlist, ui.ctx());
-        let tracks = playlist_state.tracks.clone();
-        let total_duration_ms: u64 = tracks.iter().map(|track| track.duration_ms as u64).sum();
+        let display_tracks =
+            ordered_tracks_for_view(&playlist_state.tracks, self.track_sort);
+        let total_duration_ms: u64 = playlist_state
+            .tracks
+            .iter()
+            .map(|track| track.duration_ms as u64)
+            .sum();
 
         let full_w = ui.available_width();
         let full_h = ui.available_height();
@@ -1584,7 +2325,11 @@ impl OnyxApp {
                             ui.set_width(inner_w);
 
         ui.horizontal(|ui| {
-            if let Some(url) = &playlist.image_url {
+            if crate::spotify_api::is_liked_songs_playlist(&playlist.id) {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(160.0, 160.0), egui::Sense::hover());
+                paint_liked_songs_playlist_artwork(ui.painter(), rect, 8.0);
+            } else if let Some(url) = &playlist.image_url {
                 ui.add(
                     egui::Image::new(url)
                         .corner_radius(8_u8)
@@ -1654,13 +2399,13 @@ impl OnyxApp {
                 if playlist_is_playing {
                     let pos = display_position_ms(playback_state);
                     self.update_position_immediately(pos, false);
-                    let _ = self.audio_cmd_tx.send(AudioCmd::Pause);
+                    let _ = self.audio_handle.send(AudioCmd::Pause);
                 } else if self.playlist_is_current(playlist) {
                     let pos = display_position_ms(playback_state);
                     self.update_position_immediately(pos, true);
-                    let _ = self.audio_cmd_tx.send(AudioCmd::Play);
+                    let _ = self.audio_handle.send(AudioCmd::Play);
                 } else {
-                    self.start_playlist(playlist.id.clone(), tracks.clone());
+                    self.start_playlist(playlist.id.clone(), display_tracks.clone());
                 }
             }
 
@@ -1690,9 +2435,9 @@ impl OnyxApp {
         });
 
         ui.add_space(18.0);
-        self.render_track_table_header(ui);
+        self.render_track_table_header(ui, &playlist.id);
 
-        if tracks.is_empty() {
+        if display_tracks.is_empty() {
             ui.add_space(16.0);
             let text = match &playlist_state.status {
                 PlaylistStatus::Error(err) => format!("Could not load tracks: {}", err),
@@ -1713,17 +2458,18 @@ impl OnyxApp {
                 egui::ScrollArea::vertical()
                     .id_salt("playlist_tracks_scroll")
                     .auto_shrink([false, false])
-                    .show_rows(ui, row_height, tracks.len(), |ui, row_range| {
+                    .show_rows(ui, row_height, display_tracks.len(), |ui, row_range| {
                         for row in row_range {
-                            let track = &tracks[row];
+                            let track = &display_tracks[row];
                             self.render_track_row(
                                 ui,
                                 playlist,
-                                &tracks,
+                                &display_tracks,
                                 row,
                                 track,
                                 playback_state,
                                 row_height,
+                                ctx,
                             );
                         }
                     });
@@ -1737,17 +2483,642 @@ impl OnyxApp {
         );
     }
 
-    fn render_track_table_header(&self, ui: &mut egui::Ui) {
+    fn format_audience_line(listener_display: Option<&str>, spotify_followers: u32) -> String {
+        if let Some(s) = listener_display {
+            if !s.is_empty() {
+                return s.to_string();
+            }
+        }
+        if spotify_followers == 0 {
+            return "Spotify follower count unavailable".to_string();
+        }
+        if spotify_followers >= 1_000_000 {
+            format!(
+                "{:.1}M followers on Spotify",
+                spotify_followers as f64 / 1_000_000.0
+            )
+        } else if spotify_followers >= 10_000 {
+            format!(
+                "{:.0}K followers on Spotify",
+                spotify_followers as f64 / 1000.0
+            )
+        } else if spotify_followers >= 1_000 {
+            format!(
+                "{:.1}K followers on Spotify",
+                spotify_followers as f64 / 1000.0
+            )
+        } else {
+            format!("{spotify_followers} followers on Spotify")
+        }
+    }
+
+    fn render_artist_popular_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        artist_spotify_id: &str,
+        tracks: &[PlaylistTrack],
+        row: usize,
+        track: &PlaylistTrack,
+        playback_state: &PlaybackState,
+        row_height: f32,
+        ctx: &egui::Context,
+    ) {
+        let (rect, row_resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), row_height),
+            egui::Sense::click(),
+        );
+        if row_resp.hovered() {
+            ui.painter()
+                .rect_filled(rect, 4.0, egui::Color32::from_rgb(40, 40, 40));
+        }
+
+        let content_rect = rect.shrink2(egui::vec2(16.0, 4.0));
+        let pad = 12.0;
+        let dur_w = 58.0;
+        let idx_w = 36.0;
+        let img = 36.0;
+        let title_left = content_rect.left() + idx_w + pad;
+        let title_right = content_rect.right() - dur_w - pad;
+        let muted = egui::Color32::from_rgb(179, 179, 179);
+        let green = egui::Color32::from_rgb(30, 215, 96);
+        let is_current = self.track_is_current(track, playback_state);
+        let title_color = if is_current { green } else { egui::Color32::WHITE };
+        let index_color = if is_current { green } else { muted };
+
+        let index_rect = egui::Rect::from_min_size(
+            egui::pos2(content_rect.left(), content_rect.top()),
+            egui::vec2(idx_w, content_rect.height()),
+        );
+        paint_left_text(
+            ui,
+            index_rect,
+            &format!("{}", row + 1),
+            index_color,
+            14.0,
+            false,
+        );
+
+        let image_rect = egui::Rect::from_min_size(
+            egui::pos2(title_left, content_rect.center().y - img / 2.0),
+            egui::vec2(img, img),
+        );
+        if let Some(url) = track
+            .album_thumbnail_url
+            .as_ref()
+            .or(track.album_image_url.as_ref())
+        {
+            ui.put(
+                image_rect,
+                egui::Image::new(url)
+                    .corner_radius(4_u8)
+                    .fit_to_exact_size(egui::vec2(img, img)),
+            );
+        } else {
+            ui.painter()
+                .rect_filled(image_rect, 4.0, egui::Color32::from_rgb(40, 40, 40));
+        }
+
+        let text_top = content_rect.top();
+        let text_bottom = content_rect.bottom();
+        let text_left = image_rect.right() + 10.0;
+        let name_rect = egui::Rect::from_min_max(
+            egui::pos2(text_left, text_top),
+            egui::pos2(title_right, (text_top + text_bottom) / 2.0),
+        );
+        let artist_rect = egui::Rect::from_min_max(
+            egui::pos2(text_left, (text_top + text_bottom) / 2.0),
+            egui::pos2(title_right, text_bottom),
+        );
+        let on_same_artist_page = track
+            .artist_id
+            .as_deref()
+            .is_some_and(|id| id == artist_spotify_id);
+        paint_left_text(ui, name_rect, &track.name, title_color, 14.0, true);
+        paint_left_text(ui, artist_rect, &track.artist, muted, 12.0, false);
+
+        if let Some(aid) = track.artist_id.as_deref() {
+            if !on_same_artist_page {
+                let artist_click = ui.interact(
+                    artist_rect,
+                    ui.id().with(("artist_link_popular", track.spotify_uri.as_str())),
+                    egui::Sense::click(),
+                );
+                if artist_click.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if artist_click.clicked() {
+                    self.open_artist_page(aid.to_string(), track.artist.clone(), ctx);
+                    return;
+                }
+            }
+        }
+
+        let dur_rect = egui::Rect::from_min_size(
+            egui::pos2(content_rect.right() - dur_w, content_rect.top()),
+            egui::vec2(dur_w, content_rect.height()),
+        );
+        paint_right_text(
+            ui,
+            dur_rect,
+            &format_duration(track.duration_ms),
+            muted,
+            13.0,
+        );
+
+        if row_resp.clicked() {
+            let qid = artist_queue_playlist_id(artist_spotify_id);
+            self.start_playlist_at(qid, tracks.to_vec(), row);
+        }
+    }
+
+    fn render_artist_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        artist_state: &ArtistLoadState,
+        playback_state: &PlaybackState,
+        ctx: &egui::Context,
+    ) {
+        let full_w = ui.available_width();
+        let full_h = ui.available_height();
+        let Some(aid) = artist_state.artist_id.as_deref() else {
+            ui.label(
+                egui::RichText::new("No artist selected.")
+                    .color(egui::Color32::from_rgb(179, 179, 179)),
+            );
+            return;
+        };
+
+        ui.allocate_ui_with_layout(
+            egui::vec2(full_w, full_h),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.add_space(CENTRAL_CONTENT_INSET);
+                    let inner_w = (full_w - 2.0 * CENTRAL_CONTENT_INSET).max(1.0);
+                    let row_h = ui.available_height();
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(inner_w, row_h),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_width(inner_w);
+
+                            match &artist_state.status {
+                                ArtistPageStatus::Idle | ArtistPageStatus::Loading => {
+                                    let title = if artist_state.name_hint.is_empty() {
+                                        "Loading artist…".to_string()
+                                    } else {
+                                        format!("Loading {}…", artist_state.name_hint)
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(title)
+                                            .color(egui::Color32::WHITE)
+                                            .size(28.0)
+                                            .strong(),
+                                    );
+                                }
+                                ArtistPageStatus::Error(msg) => {
+                                    ui.label(
+                                        egui::RichText::new(msg)
+                                            .color(egui::Color32::from_rgb(255, 160, 120))
+                                            .size(14.0),
+                                    );
+                                }
+                                ArtistPageStatus::Loaded => {
+                                    if let Some(profile) = &artist_state.profile {
+                                        let key = Self::artist_color_cache_key(&profile.id);
+                                        self.ensure_color_from_cover_url(
+                                            key,
+                                            profile
+                                                .image_url
+                                                .clone()
+                                                .or_else(|| profile.thumbnail_url.clone()),
+                                            None,
+                                            ui.ctx(),
+                                        );
+
+                                        ui.horizontal(|ui| {
+                                            let size = 160.0_f32;
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(size, size),
+                                                egui::Layout::top_down(egui::Align::Center),
+                                                |ui| {
+                                                    ui.set_width(size);
+                                                    if let Some(url) = profile
+                                                        .image_url
+                                                        .as_ref()
+                                                        .or(profile.thumbnail_url.as_ref())
+                                                    {
+                                                        ui.add(
+                                                            egui::Image::new(url)
+                                                                .maintain_aspect_ratio(true)
+                                                                .bg_fill(egui::Color32::from_rgb(
+                                                                    24, 24, 24,
+                                                                ))
+                                                                .corner_radius((size / 2.0) as u8)
+                                                                .fit_to_exact_size(egui::vec2(
+                                                                    size, size,
+                                                                )),
+                                                        );
+                                                    } else {
+                                                        let (r, _) = ui.allocate_exact_size(
+                                                            egui::vec2(size, size),
+                                                            egui::Sense::hover(),
+                                                        );
+                                                        ui.painter().rect_filled(
+                                                            r,
+                                                            size / 2.0,
+                                                            egui::Color32::from_rgb(40, 40, 40),
+                                                        );
+                                                    }
+                                                },
+                                            );
+
+                                            ui.add_space(24.0);
+                                            ui.vertical(|ui| {
+                                                ui.add_space(28.0);
+                                                ui.label(
+                                                    egui::RichText::new("Artist")
+                                                        .color(egui::Color32::WHITE)
+                                                        .size(12.0),
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new(&profile.name)
+                                                        .color(egui::Color32::WHITE)
+                                                        .size(44.0)
+                                                        .strong(),
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        Self::format_audience_line(
+                                                            artist_state
+                                                                .listener_display
+                                                                .as_deref(),
+                                                            profile.followers,
+                                                        ),
+                                                    )
+                                                    .color(egui::Color32::from_rgb(
+                                                        179, 179, 179,
+                                                    ))
+                                                    .size(14.0),
+                                                );
+                                            });
+                                        });
+
+                                        ui.add_space(24.0);
+                                        let qid = artist_queue_playlist_id(aid);
+                                        let from_this_artist = self
+                                            .queue_playlist_id
+                                            .as_deref()
+                                            == Some(qid.as_str());
+                                        let playlist_is_playing =
+                                            from_this_artist && playback_state.is_playing;
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 14.0;
+                                            if play_pause_button(
+                                                ui,
+                                                48.0,
+                                                playlist_is_playing,
+                                                egui::Color32::from_rgb(30, 215, 96),
+                                                egui::Color32::BLACK,
+                                            )
+                                            .clicked()
+                                            {
+                                                if playlist_is_playing {
+                                                    let pos =
+                                                        display_position_ms(playback_state);
+                                                    self.update_position_immediately(pos, false);
+                                                    let _ = self.audio_handle.send(AudioCmd::Pause);
+                                                } else if from_this_artist {
+                                                    let pos =
+                                                        display_position_ms(playback_state);
+                                                    self.update_position_immediately(pos, true);
+                                                    let _ = self.audio_handle.send(AudioCmd::Play);
+                                                } else {
+                                                    self.start_playlist(
+                                                        qid.clone(),
+                                                        artist_state.popular_tracks.clone(),
+                                                    );
+                                                }
+                                            }
+
+                                            let shuffle_color = if self.shuffle {
+                                                ACCENT_GREEN
+                                            } else {
+                                                egui::Color32::from_rgb(179, 179, 179)
+                                            };
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new("🔀")
+                                                            .size(20.0)
+                                                            .color(shuffle_color),
+                                                    )
+                                                    .frame(false),
+                                                )
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .clicked()
+                                            {
+                                                self.toggle_shuffle();
+                                            }
+                                            let _ = ui.add(
+                                                egui::Button::new(
+                                                    egui::RichText::new("•••")
+                                                        .size(20.0)
+                                                        .color(egui::Color32::from_rgb(
+                                                            179, 179, 179,
+                                                        )),
+                                                )
+                                                .frame(false),
+                                            );
+                                        });
+
+                                        ui.add_space(28.0);
+                                        ui.label(
+                                            egui::RichText::new("Popular")
+                                                .color(egui::Color32::WHITE)
+                                                .size(20.0)
+                                                .strong(),
+                                        );
+                                        ui.add_space(12.0);
+
+                                        if artist_state.popular_tracks.is_empty() {
+                                            let msg = if self.app_config.lastfm_api_key.trim().is_empty()
+                                            {
+                                                "No popular tracks from Spotify. Add a Last.fm API key in Settings for Last.fm charts."
+                                            } else {
+                                                "No popular tracks returned from Last.fm."
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(msg)
+                                                    .color(egui::Color32::from_rgb(179, 179, 179))
+                                                    .size(13.0),
+                                            );
+                                        } else {
+                                            let visible = (if artist_state.popular_show_all {
+                                                10
+                                            } else {
+                                                5
+                                            })
+                                            .min(artist_state.popular_tracks.len());
+                                            let row_height = 48.0_f32;
+                                            let scroll_h = ui.available_height().max(0.0);
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(ui.available_width(), scroll_h),
+                                                egui::Layout::top_down(egui::Align::Min),
+                                                |ui| {
+                                                    egui::ScrollArea::vertical()
+                                                        .id_salt("artist_popular_scroll")
+                                                        .auto_shrink([false, false])
+                                                        .show_rows(
+                                                            ui,
+                                                            row_height,
+                                                            visible,
+                                                            |ui, row_range| {
+                                                                for row in row_range {
+                                                                    let track =
+                                                                        &artist_state.popular_tracks
+                                                                            [row];
+                                                                    self.render_artist_popular_row(
+                                                                        ui,
+                                                                        aid,
+                                                                        &artist_state.popular_tracks,
+                                                                        row,
+                                                                        track,
+                                                                        playback_state,
+                                                                        row_height,
+                                                                        ctx,
+                                                                    );
+                                                                }
+                                                            },
+                                                        );
+                                                    if artist_state.popular_tracks.len() > 5 {
+                                                        ui.add_space(6.0);
+                                                        let label = if artist_state.popular_show_all
+                                                        {
+                                                            "Show less"
+                                                        } else {
+                                                            "Show more"
+                                                        };
+                                                        if ui
+                                                            .link(
+                                                                egui::RichText::new(label)
+                                                                    .color(egui::Color32::from_rgb(
+                                                                        179, 179, 179,
+                                                                    ))
+                                                                    .size(13.0),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            if let Ok(mut s) =
+                                                                self.artist_state.lock()
+                                                            {
+                                                                s.popular_show_all =
+                                                                    !s.popular_show_all;
+                                                            }
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                        }
+
+                                        ui.add_space(32.0);
+                                        ui.label(
+                                            egui::RichText::new("Discography")
+                                                .color(egui::Color32::WHITE)
+                                                .size(20.0)
+                                                .strong(),
+                                        );
+                                        ui.add_space(12.0);
+                                        if artist_state.albums.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "No releases from Spotify for this artist.",
+                                                )
+                                                .color(egui::Color32::from_rgb(179, 179, 179))
+                                                .size(13.0),
+                                            );
+                                        } else {
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("artist_albums_scroll")
+                                                .max_height(320.0)
+                                                .auto_shrink([false, false])
+                                                .show(ui, |ui| {
+                                                    for album in &artist_state.albums {
+                                                        ui.horizontal(|ui| {
+                                                            let sz = 56.0_f32;
+                                                            if let Some(url) =
+                                                                &album.thumbnail_url
+                                                            {
+                                                                ui.add(
+                                                                    egui::Image::new(url)
+                                                                        .corner_radius(4_u8)
+                                                                        .fit_to_exact_size(
+                                                                            egui::vec2(sz, sz),
+                                                                        ),
+                                                                );
+                                                            } else {
+                                                                let (r, _) = ui
+                                                                    .allocate_exact_size(
+                                                                        egui::vec2(sz, sz),
+                                                                        egui::Sense::hover(),
+                                                                    );
+                                                                ui.painter().rect_filled(
+                                                                    r,
+                                                                    4.0,
+                                                                    egui::Color32::from_rgb(
+                                                                        40, 40, 40,
+                                                                    ),
+                                                                );
+                                                            }
+                                                            ui.add_space(12.0);
+                                                            ui.vertical(|ui| {
+                                                                ui.label(
+                                                                    egui::RichText::new(
+                                                                        &album.name,
+                                                                    )
+                                                                    .color(egui::Color32::WHITE)
+                                                                    .size(15.0)
+                                                                    .strong(),
+                                                                );
+                                                                let meta = format!(
+                                                                    "{} • {}",
+                                                                    album.album_type_label,
+                                                                    album.release_year
+                                                                );
+                                                                ui.label(
+                                                                    egui::RichText::new(meta)
+                                                                        .color(
+                                                                            egui::Color32::from_rgb(
+                                                                                179,
+                                                                                179,
+                                                                                179,
+                                                                            ),
+                                                                        )
+                                                                        .size(12.0),
+                                                                );
+                                                            });
+                                                        });
+                                                        ui.add_space(8.0);
+                                                    }
+                                                });
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    );
+                    ui.add_space(CENTRAL_CONTENT_INSET);
+                });
+            },
+        );
+    }
+
+    fn render_track_table_header(&mut self, ui: &mut egui::Ui, playlist_id: &str) {
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
         let rect = rect.shrink2(egui::vec2(16.0, 0.0));
         let columns = TrackTableLayout::for_width(rect.width()).rects(rect);
         let color = egui::Color32::from_rgb(179, 179, 179);
-        paint_left_text(ui, columns.index, "#", color, 13.0, false);
-        paint_left_text(ui, columns.title, "Title", color, 13.0, false);
-        paint_left_text(ui, columns.album, "Album", color, 13.0, false);
-        paint_left_text(ui, columns.added, "Date added", color, 13.0, false);
-        paint_right_text(ui, columns.duration, "Time", color, 13.0);
+
+        let header_cell = |ui: &mut egui::Ui,
+                           this: &mut Self,
+                           col_rect: egui::Rect,
+                           label: &str,
+                           column: TrackSortColumn,
+                           salt: &'static str| {
+            let id = ui.id().with(("track_sort_hdr", playlist_id, salt));
+            let resp = ui.interact(col_rect, id, egui::Sense::click());
+            if resp.clicked() {
+                this.track_sort = cycle_track_sort(this.track_sort, column);
+            }
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let sorted_here = matches!(this.track_sort, Some((c, _)) if c == column);
+            let natural_w = header_label_width(ui, label, 13.0);
+            let arrow_block = HEADER_SORT_ARROW_GAP + SORT_HEADER_ARROW_SIZE * 0.95;
+            let max_label_w = (col_rect.width() - arrow_block).max(0.0);
+            let used_for_arrow = natural_w.min(max_label_w);
+            // Reserve arrow space from the column's right edge so short labels (e.g. "Title") are not
+            // squeezed into `used_for_arrow` px — that triggered elide_to_width → "Ti...".
+            let text_rect = if sorted_here {
+                col_rect.with_max_x((col_rect.right() - arrow_block).max(col_rect.left()))
+            } else {
+                col_rect
+            };
+            paint_left_text(ui, text_rect, label, color, 13.0, false);
+            if let Some((c, dir)) = this.track_sort {
+                if c == column {
+                    let arrow_center_x = (col_rect.left()
+                        + used_for_arrow
+                        + HEADER_SORT_ARROW_GAP
+                        + sort_triangle_half_width())
+                    .min(col_rect.right() - 2.0);
+                    let arrow_center =
+                        egui::pos2(arrow_center_x, sort_header_triangle_center_y(col_rect, 13.0));
+                    paint_sort_triangle_arrow(
+                        ui.painter(),
+                        arrow_center,
+                        matches!(dir, TrackSortDirection::Asc),
+                        color,
+                        SORT_HEADER_ARROW_SIZE,
+                    );
+                }
+            }
+        };
+
+        header_cell(ui, self, columns.index, "#", TrackSortColumn::Index, "idx");
+        header_cell(ui, self, columns.title, "Title", TrackSortColumn::Title, "title");
+        header_cell(ui, self, columns.album, "Album", TrackSortColumn::Album, "album");
+        header_cell(
+            ui,
+            self,
+            columns.added,
+            "Date added",
+            TrackSortColumn::DateAdded,
+            "added",
+        );
+        let duration_sorted = matches!(
+            self.track_sort,
+            Some((TrackSortColumn::Duration, _))
+        );
+        let (duration_text_rect, duration_arrow_x) = if duration_sorted {
+            let tw = header_label_width(ui, "Time", 13.0);
+            let arrow_block = HEADER_SORT_ARROW_GAP + SORT_HEADER_ARROW_SIZE * 0.95;
+            let max_tw = (columns.duration.width() - arrow_block).max(0.0);
+            let used = tw.min(max_tw);
+            let min_x = (columns.duration.right() - used - arrow_block).max(columns.duration.left());
+            let arrow_x = columns.duration.right()
+                - used
+                - HEADER_SORT_ARROW_GAP
+                - sort_triangle_half_width();
+            (
+                columns.duration.with_min_x(min_x),
+                Some(arrow_x.max(columns.duration.left() + sort_triangle_half_width())),
+            )
+        } else {
+            (columns.duration, None)
+        };
+        let id = ui.id().with(("track_sort_hdr", playlist_id, "dur"));
+        let resp = ui.interact(columns.duration, id, egui::Sense::click());
+        if resp.clicked() {
+            self.track_sort = cycle_track_sort(self.track_sort, TrackSortColumn::Duration);
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        paint_right_text(ui, duration_text_rect, "Time", color, 13.0);
+        if let (Some((TrackSortColumn::Duration, dir)), Some(ax)) =
+            (self.track_sort, duration_arrow_x)
+        {
+            paint_sort_triangle_arrow(
+                ui.painter(),
+                egui::pos2(ax, sort_header_triangle_center_y(columns.duration, 13.0)),
+                matches!(dir, TrackSortDirection::Asc),
+                color,
+                SORT_HEADER_ARROW_SIZE,
+            );
+        }
     }
 
     fn render_track_row(
@@ -1759,17 +3130,15 @@ impl OnyxApp {
         track: &PlaylistTrack,
         playback_state: &PlaybackState,
         row_height: f32,
+        ctx: &egui::Context,
     ) {
-        let (rect, resp) = ui.allocate_exact_size(
+        let (rect, row_hover) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), row_height),
-            egui::Sense::click(),
+            egui::Sense::hover(),
         );
-        if resp.hovered() {
+        if row_hover.hovered() {
             ui.painter()
                 .rect_filled(rect, 4.0, egui::Color32::from_rgb(40, 40, 40));
-        }
-        if resp.clicked() {
-            self.start_playlist_at(playlist.id.clone(), tracks.to_vec(), row);
         }
 
         let content_rect = rect.shrink2(egui::vec2(16.0, 4.0));
@@ -1830,7 +3199,6 @@ impl OnyxApp {
             title_text_rect.right_bottom(),
         );
         paint_left_text(ui, name_rect, &track.name, title_color, 14.0, true);
-        paint_left_text(ui, artist_rect, &track.artist, muted, 12.0, false);
         paint_left_text(ui, columns.album, &track.album, muted, 13.0, false);
         paint_left_text(
             ui,
@@ -1847,6 +3215,53 @@ impl OnyxApp {
             muted,
             13.0,
         );
+
+        let artist_line_h = artist_rect.height();
+        let artist_galley_w =
+            elided_text_width(ui, &track.artist, artist_rect.width(), 12.0).min(artist_rect.width());
+        let artist_hit_rect = egui::Rect::from_min_size(
+            artist_rect.left_top(),
+            egui::vec2(artist_galley_w.max(1.0), artist_line_h),
+        );
+
+        let mut play_rect = columns.index;
+        play_rect = play_rect.union(image_rect);
+        play_rect = play_rect.union(name_rect);
+        play_rect = play_rect.union(columns.album);
+        play_rect = play_rect.union(columns.added);
+        play_rect = play_rect.union(columns.duration);
+
+        let play_click = ui.interact(
+            play_rect,
+            ui.id().with(("pl_row_play", playlist.id.as_str(), row)),
+            egui::Sense::click(),
+        );
+
+        if let Some(aid) = track.artist_id.as_deref() {
+            let artist_click = ui.interact(
+                artist_hit_rect,
+                ui.id().with(("pl_row_artist", playlist.id.as_str(), row)),
+                egui::Sense::click(),
+            );
+            let artist_color = if artist_click.hovered() {
+                egui::Color32::from_rgb(230, 230, 230)
+            } else {
+                muted
+            };
+            paint_left_text(ui, artist_rect, &track.artist, artist_color, 12.0, false);
+            if artist_click.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if artist_click.clicked() {
+                self.open_artist_page(aid.to_string(), track.artist.clone(), ctx);
+                return;
+            }
+        } else {
+            paint_left_text(ui, artist_rect, &track.artist, muted, 12.0, false);
+        }
+        if play_click.clicked() {
+            self.start_playlist_at(playlist.id.clone(), tracks.to_vec(), row);
+        }
     }
 
     fn render_dashboard_view(&mut self, ui: &mut egui::Ui) {
@@ -2338,7 +3753,7 @@ impl OnyxApp {
 
     fn apply_equalizer_settings(&mut self) {
         let _ = self
-            .audio_cmd_tx
+            .audio_handle
             .send(AudioCmd::SetEqualizer(self.user_settings.equalizer.clone()));
         match self.user_settings.save() {
             Ok(()) => self.settings_status = Some("Equalizer settings saved.".to_string()),
@@ -2536,6 +3951,7 @@ impl OnyxApp {
         if let Ok(mut state) = self.playback_state.lock() {
             state.track_name = track.name.clone();
             state.artist_name = track.artist.clone();
+            state.artist_id = track.artist_id.clone();
             state.artwork_url = track.album_image_url.clone();
             state.spotify_uri = Some(track.spotify_uri.clone());
             state.position_ms = 0;
@@ -2545,11 +3961,13 @@ impl OnyxApp {
             state.is_playing = true;
         }
 
-        let _ = self.audio_cmd_tx.send(AudioCmd::Load {
+        if let Err(e) = self.audio_handle.send(AudioCmd::Load {
             uri: track.spotify_uri.clone(),
             start_playing: true,
             position_ms: 0,
-        });
+        }) {
+            log::error!("Failed to send play command to audio engine: {}", e);
+        }
     }
 
     fn start_playlist_when_ready(&mut self, playlist_id: &str) {
@@ -2640,6 +4058,9 @@ impl OnyxApp {
         ctx: &egui::Context,
         playlist: &PlaylistSummary,
     ) {
+        if crate::spotify_api::is_liked_songs_playlist(&playlist.id) {
+            return;
+        }
         let status = self
             .download_statuses
             .lock()
@@ -2681,10 +4102,13 @@ impl OnyxApp {
             .and_then(|cache| cache.load_tracks(&playlist.id).ok().flatten())
             .map(|cached| cached.tracks)
             .unwrap_or_default();
+        let Some(spotify) = self.spotify.clone() else {
+            return;
+        };
         let task = crate::downloads::spawn_playlist_download(
             &self.rt,
-            self.spotify.clone(),
-            self.audio_cmd_tx.clone(),
+            spotify,
+            self.audio_handle.clone(),
             self.download_statuses.clone(),
             playlist.clone(),
             cached_tracks,
@@ -2758,16 +4182,22 @@ impl OnyxApp {
             return;
         };
         let state = self.playlist_state.lock().unwrap().clone();
-        if state.playlist_id.as_deref() != Some(playlist_id.as_str()) || state.tracks.is_empty() {
+        let source_tracks = if state.playlist_id.as_deref() == Some(playlist_id.as_str())
+            && !state.tracks.is_empty()
+        {
+            state.tracks.clone()
+        } else if !self.queue_original_tracks.is_empty() {
+            self.queue_original_tracks.clone()
+        } else {
             return;
-        }
+        };
 
         let current_uri = self
             .queue_index
             .and_then(|index| self.queue.get(index))
             .map(|track| track.spotify_uri.clone());
 
-        self.queue = state.tracks;
+        self.queue = source_tracks;
         self.queue_index = current_uri
             .as_deref()
             .and_then(|uri| self.queue.iter().position(|track| track.spotify_uri == uri))
@@ -2782,6 +4212,7 @@ impl OnyxApp {
         }
 
         self.mark_playlist_recent(&playlist_id);
+        self.queue_original_tracks = tracks.clone();
         self.queue = tracks;
         self.queue_playlist_id = Some(playlist_id);
         if self.shuffle {
@@ -2801,6 +4232,7 @@ impl OnyxApp {
         self.mark_playlist_recent(&playlist_id);
         self.queue_playlist_id = Some(playlist_id);
         self.pending_queue_index = None;
+        self.queue_original_tracks = tracks.clone();
 
         if self.shuffle {
             let current_track = tracks[start_index].clone();
@@ -2871,7 +4303,7 @@ impl OnyxApp {
 
     fn play_previous(&mut self) {
         if self.queue.is_empty() {
-            let _ = self.audio_cmd_tx.send(AudioCmd::Seek { position_ms: 0 });
+            let _ = self.audio_handle.send(AudioCmd::Seek { position_ms: 0 });
             self.update_position_immediately(0, true);
             return;
         }
@@ -2922,7 +4354,7 @@ impl OnyxApp {
         if force_send || self.last_sent_volume.abs_diff(volume) > 384 {
             self.last_sent_volume = volume;
             let _ = self
-                .audio_cmd_tx
+                .audio_handle
                 .send(AudioCmd::SetVolume { volume_u16: volume });
         }
     }
@@ -3039,6 +4471,49 @@ fn play_pause_button(
         ));
     }
 
+    response
+}
+
+/// Previous / next track: drawn double chevrons so glyphs do not depend on emoji font coverage.
+fn track_skip_button(
+    ui: &mut egui::Ui,
+    size: f32,
+    forward: bool,
+    base_color: egui::Color32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let color = if response.hovered() {
+        lighten(base_color, 35)
+    } else {
+        base_color
+    };
+    let painter = ui.painter();
+    let c = rect.center();
+    let tri_w = size * 0.36;
+    let tri_h = size * 0.4;
+    let pair_shift = size * 0.135;
+    for dx in [-pair_shift, pair_shift] {
+        let cx = c.x + dx;
+        let (tip, a, b) = if forward {
+            (
+                egui::pos2(cx + tri_w * 0.48, c.y),
+                egui::pos2(cx - tri_w * 0.42, c.y - tri_h * 0.52),
+                egui::pos2(cx - tri_w * 0.42, c.y + tri_h * 0.52),
+            )
+        } else {
+            (
+                egui::pos2(cx - tri_w * 0.48, c.y),
+                egui::pos2(cx + tri_w * 0.42, c.y - tri_h * 0.52),
+                egui::pos2(cx + tri_w * 0.42, c.y + tri_h * 0.52),
+            )
+        };
+        painter.add(egui::Shape::convex_polygon(
+            vec![tip, a, b],
+            color,
+            egui::Stroke::NONE,
+        ));
+    }
     response
 }
 
@@ -3195,6 +4670,53 @@ fn paint_volume_icon(ui: &egui::Ui, rect: egui::Rect, muted: bool, hovered: bool
     }
 }
 
+/// Liked Songs placeholder art: blue–purple diagonal gradient and a white heart.
+fn paint_liked_songs_playlist_artwork(painter: &egui::Painter, rect: egui::Rect, _corner_radius: f32) {
+    use egui::epaint::{Mesh, Shape, Vertex};
+    use egui::{FontId, Pos2, TextureId};
+
+    let tl = egui::Color32::from_rgb(45, 140, 255);
+    let tr = egui::Color32::from_rgb(110, 105, 250);
+    let bl = egui::Color32::from_rgb(88, 86, 230);
+    let br = egui::Color32::from_rgb(180, 95, 245);
+
+    let mut mesh = Mesh::with_texture(TextureId::default());
+    let uv = Pos2::ZERO;
+    let i0 = mesh.vertices.len() as u32;
+    mesh.vertices.push(Vertex {
+        pos: rect.left_top(),
+        uv,
+        color: tl,
+    });
+    mesh.vertices.push(Vertex {
+        pos: rect.right_top(),
+        uv,
+        color: tr,
+    });
+    mesh.vertices.push(Vertex {
+        pos: rect.right_bottom(),
+        uv,
+        color: br,
+    });
+    mesh.vertices.push(Vertex {
+        pos: rect.left_bottom(),
+        uv,
+        color: bl,
+    });
+    mesh.add_triangle(i0, i0 + 1, i0 + 2);
+    mesh.add_triangle(i0, i0 + 2, i0 + 3);
+    painter.add(Shape::mesh(mesh));
+
+    let heart_size = rect.height().min(rect.width()) * 0.52;
+    let galley = painter.layout_no_wrap(
+        "♥".to_string(),
+        FontId::proportional(heart_size),
+        egui::Color32::WHITE,
+    );
+    let pos = rect.center() - galley.size() / 2.0;
+    painter.galley(pos, galley, egui::Color32::WHITE);
+}
+
 fn paint_pin_indicator(ui: &egui::Ui, row_rect: egui::Rect) {
     const PIN_SVG: &[u8] = include_bytes!("../assets/fonts/pin.svg");
     const PIN_URI: &str = "bytes://onyx/pin.svg";
@@ -3331,6 +4853,150 @@ fn playlist_status_text(state: &PlaylistLoadState, expected_count: u32) -> Strin
     }
 }
 
+/// Proportional stack uses Manrope first for metrics; this family is **only** color/outline emoji
+/// fonts so mixed [`LayoutJob`] sections can pick Apple/Segoe/Noto for emoji codepoints.
+const EMOJI_FALLBACK_FAMILY: &str = "emoji_fallback";
+
+#[allow(dead_code)]
+#[inline]
+fn font_emoji(size: f32) -> egui::FontId {
+    egui::FontId::new(
+        size,
+        egui::FontFamily::Name(EMOJI_FALLBACK_FAMILY.into()),
+    )
+}
+
+#[allow(dead_code)]
+fn char_prefers_emoji_font(c: char) -> bool {
+    let cp = c as u32;
+    if matches!(c, '\u{FE0F}' | '\u{FE0E}' | '\u{200D}') {
+        return true;
+    }
+    if (0x1F300..=0x1FAFF).contains(&cp) {
+        return true;
+    }
+    if (0x1F1E6..=0x1F1FF).contains(&cp) {
+        return true;
+    }
+    if (0x1F3FB..=0x1F3FF).contains(&cp) {
+        return true;
+    }
+    if (0x2600..=0x27BF).contains(&cp) {
+        return true;
+    }
+    if (0x2300..=0x23FF).contains(&cp) {
+        return true;
+    }
+    if (0x2190..=0x21FF).contains(&cp) {
+        return true;
+    }
+    if (0x25A0..=0x25FF).contains(&cp) {
+        return true;
+    }
+    if (0x2B00..=0x2BFF).contains(&cp) {
+        return true;
+    }
+    cp == 0x20E3
+}
+
+#[allow(dead_code)]
+fn split_emoji_runs(s: &str) -> Vec<(bool, String)> {
+    let mut runs: Vec<(bool, String)> = Vec::new();
+    let mut cur_is_emoji: Option<bool> = None;
+    let mut buf = String::new();
+    for c in s.chars() {
+        // Keep VS16/VS15/ZWJ on the same run as surrounding emoji text (ZWJ sequences).
+        if matches!(c, '\u{200d}' | '\u{fe0f}' | '\u{fe0e}') {
+            if cur_is_emoji.is_some() {
+                buf.push(c);
+            }
+            continue;
+        }
+        let is_e = char_prefers_emoji_font(c);
+        match cur_is_emoji {
+            None => {
+                cur_is_emoji = Some(is_e);
+                buf.push(c);
+            }
+            Some(prev) if prev == is_e => buf.push(c),
+            Some(_) => {
+                runs.push((cur_is_emoji.unwrap_or(false), std::mem::take(&mut buf)));
+                cur_is_emoji = Some(is_e);
+                buf.push(c);
+            }
+        }
+    }
+    if !buf.is_empty() {
+        runs.push((cur_is_emoji.unwrap_or(false), buf));
+    }
+    runs
+}
+
+#[allow(dead_code)]
+fn mixed_text_format(font_id: egui::FontId, color: egui::Color32, size: f32) -> TextFormat {
+    TextFormat {
+        font_id,
+        color,
+        line_height: Some((size * 1.15).ceil()),
+        valign: egui::Align::Center,
+        ..Default::default()
+    }
+}
+
+#[allow(dead_code)]
+fn paint_left_text_mixed(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    text: &str,
+    color: egui::Color32,
+    size: f32,
+    strong: bool,
+) {
+    let text = elide_to_width_mixed(text, rect.width(), size);
+    if text.is_empty() {
+        return;
+    }
+    let pos = egui::pos2(rect.left(), rect.center().y - size * 0.55);
+    let mut job = LayoutJob::default();
+    job.break_on_newline = false;
+    for (emoji, chunk) in split_emoji_runs(&text) {
+        let mut font_id = if emoji {
+            font_emoji(size)
+        } else {
+            egui::FontId::proportional(size)
+        };
+        if emoji {
+            let probe = ui.painter().layout_no_wrap(
+                chunk.clone(),
+                font_id.clone(),
+                color,
+            );
+            if !chunk.is_empty() && probe.size().x < 0.01 {
+                font_id = egui::FontId::proportional(size);
+            }
+        }
+        job.append(&chunk, 0.0, mixed_text_format(font_id, color, size));
+    }
+    let galley = ui.painter().layout_job(job);
+    ui.painter().galley(pos, galley.clone(), color);
+    if strong {
+        ui.painter()
+            .galley(pos + egui::vec2(0.35, 0.0), galley, color);
+    }
+}
+
+fn elided_text_width(ui: &egui::Ui, text: &str, max_width: f32, size: f32) -> f32 {
+    let s = elide_to_width(text, max_width, size);
+    ui.painter()
+        .layout_no_wrap(
+            s,
+            egui::FontId::proportional(size),
+            egui::Color32::PLACEHOLDER,
+        )
+        .size()
+        .x
+}
+
 fn paint_left_text(
     ui: &egui::Ui,
     rect: egui::Rect,
@@ -3364,6 +5030,60 @@ fn paint_right_text(ui: &egui::Ui, rect: egui::Rect, text: &str, color: egui::Co
     ui.painter().galley(pos, galley, color);
 }
 
+/// Sort triangle height (width scales with this).
+const SORT_HEADER_ARROW_SIZE: f32 = 9.0;
+/// Gap between header label text and the sort triangle centerline.
+const HEADER_SORT_ARROW_GAP: f32 = 8.0;
+
+#[inline]
+fn sort_triangle_half_width() -> f32 {
+    SORT_HEADER_ARROW_SIZE * 0.95 * 0.5
+}
+
+/// Vertical alignment for sort triangles vs header caps (text uses `center.y - size * 0.55`).
+fn sort_header_triangle_center_y(col_rect: egui::Rect, font_size: f32) -> f32 {
+    col_rect.center().y + font_size * 0.14
+}
+
+fn header_label_width(ui: &egui::Ui, label: &str, size: f32) -> f32 {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_string(),
+        egui::FontId::proportional(size),
+        egui::Color32::PLACEHOLDER,
+    );
+    galley.size().x
+}
+
+fn paint_sort_triangle_arrow(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    ascending: bool,
+    color: egui::Color32,
+    height: f32,
+) {
+    let w = height * 0.95;
+    let h = height * 0.52;
+    if ascending {
+        let tip = center + egui::vec2(0.0, -h * 0.5);
+        let bl = center + egui::vec2(-w * 0.5, h * 0.5);
+        let br = center + egui::vec2(w * 0.5, h * 0.5);
+        painter.add(egui::Shape::convex_polygon(
+            vec![tip, bl, br],
+            color,
+            egui::Stroke::NONE,
+        ));
+    } else {
+        let tip = center + egui::vec2(0.0, h * 0.5);
+        let tl = center + egui::vec2(-w * 0.5, -h * 0.5);
+        let tr = center + egui::vec2(w * 0.5, -h * 0.5);
+        painter.add(egui::Shape::convex_polygon(
+            vec![tip, tl, tr],
+            color,
+            egui::Stroke::NONE,
+        ));
+    }
+}
+
 fn elide_to_width(text: &str, width: f32, size: f32) -> String {
     let approx_chars = (width / (size * 0.48)).floor().max(1.0) as usize;
     if text.chars().count() <= approx_chars {
@@ -3373,6 +5093,117 @@ fn elide_to_width(text: &str, width: f32, size: f32) -> String {
     let mut clipped: String = text.chars().take(take).collect();
     clipped.push('…');
     clipped
+}
+
+/// Like [`elide_to_width`] but counts emoji codepoints as wider so all-emoji titles are not over-elided.
+#[allow(dead_code)]
+fn elide_to_width_mixed(text: &str, width: f32, size: f32) -> String {
+    let unit = size * 0.48;
+    let max_units = (width / unit).floor().max(1.0);
+    let mut used = 0.0_f32;
+    let mut out = String::new();
+    for c in text.chars() {
+        let w = if char_prefers_emoji_font(c) { 2.0 } else { 1.0 };
+        if used + w > max_units {
+            if !out.is_empty() {
+                out.push('…');
+            }
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out
+}
+
+fn cycle_track_sort(
+    current: Option<(TrackSortColumn, TrackSortDirection)>,
+    column: TrackSortColumn,
+) -> Option<(TrackSortColumn, TrackSortDirection)> {
+    match current {
+        None => Some((column, TrackSortDirection::Asc)),
+        Some((c, TrackSortDirection::Asc)) if c == column => {
+            Some((column, TrackSortDirection::Desc))
+        }
+        Some((c, TrackSortDirection::Desc)) if c == column => None,
+        Some(_) => Some((column, TrackSortDirection::Asc)),
+    }
+}
+
+fn cmp_opt_date_added(a: &Option<String>, b: &Option<String>) -> std::cmp::Ordering {
+    match (a, b) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(a), Some(b)) => {
+            match (
+                DateTime::parse_from_rfc3339(a),
+                DateTime::parse_from_rfc3339(b),
+            ) {
+                (Ok(pa), Ok(pb)) => pa.cmp(&pb),
+                (Err(_), Err(_)) => a.cmp(b),
+                (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+            }
+        }
+    }
+}
+
+fn ordered_tracks_for_view(
+    tracks: &[PlaylistTrack],
+    sort: Option<(TrackSortColumn, TrackSortDirection)>,
+) -> Vec<PlaylistTrack> {
+    let mut v: Vec<PlaylistTrack> = tracks.to_vec();
+    let Some((col, dir)) = sort else {
+        return v;
+    };
+    let ascending = matches!(dir, TrackSortDirection::Asc);
+    match col {
+        TrackSortColumn::Index => {
+            v.sort_by(|a, b| {
+                let o = a.position.cmp(&b.position);
+                let o = if ascending { o } else { o.reverse() };
+                o.then_with(|| a.spotify_uri.cmp(&b.spotify_uri))
+            });
+        }
+        TrackSortColumn::Title => {
+            v.sort_by(|a, b| {
+                let o = a
+                    .name
+                    .to_lowercase()
+                    .cmp(&b.name.to_lowercase())
+                    .then_with(|| a.artist.to_lowercase().cmp(&b.artist.to_lowercase()));
+                let o = if ascending { o } else { o.reverse() };
+                o.then_with(|| a.spotify_uri.cmp(&b.spotify_uri))
+            });
+        }
+        TrackSortColumn::Album => {
+            v.sort_by(|a, b| {
+                let o = a
+                    .album
+                    .to_lowercase()
+                    .cmp(&b.album.to_lowercase())
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                let o = if ascending { o } else { o.reverse() };
+                o.then_with(|| a.spotify_uri.cmp(&b.spotify_uri))
+            });
+        }
+        TrackSortColumn::DateAdded => {
+            v.sort_by(|a, b| {
+                let o = cmp_opt_date_added(&a.added_at, &b.added_at);
+                let o = if ascending { o } else { o.reverse() };
+                o.then_with(|| a.spotify_uri.cmp(&b.spotify_uri))
+            });
+        }
+        TrackSortColumn::Duration => {
+            v.sort_by(|a, b| {
+                let o = a.duration_ms.cmp(&b.duration_ms);
+                let o = if ascending { o } else { o.reverse() };
+                o.then_with(|| a.spotify_uri.cmp(&b.spotify_uri))
+            });
+        }
+    }
+    v
 }
 
 fn shuffle_tracks(tracks: &mut [PlaylistTrack]) {
@@ -3411,18 +5242,118 @@ fn playlist_order_rank(playlist_id: &str, ordering: &PlaylistOrderingSettings) -
         return (0, index);
     }
 
+    if crate::spotify_api::is_liked_songs_playlist(playlist_id) {
+        return (1, 0);
+    }
+
     if let Some(index) = ordering
         .recent_playlist_ids
         .iter()
         .position(|id| id == playlist_id)
     {
-        return (1, index);
+        return (2, index);
     }
 
-    (2, usize::MAX)
+    (3, usize::MAX)
 }
 
-fn install_manrope_font(ctx: &egui::Context) {
+/// UI font setup: **Manrope must be first** for proportional text so Latin, digits, and spaces use
+/// correct advances (embedded **Noto Emoji** ahead of Manrope can still “win” basic codepoints with
+/// broken metrics—same root cause as wide spacing). Order after Manrope: Noto Emoji, optional
+/// system color emoji, CJK, Ubuntu, emoji-icon-font last.
+fn configure_ui_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    if let Some(bytes) = load_manrope_font_bytes() {
+        fonts.font_data.insert(
+            "Manrope".to_owned(),
+            egui::FontData::from_owned(bytes).into(),
+        );
+    }
+
+    let mut system_emoji_key: Option<String> = None;
+    for path in system_emoji_font_paths() {
+        match std::fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => {
+                log::info!(
+                    "Loaded system color emoji font from {}",
+                    path.display()
+                );
+                fonts.font_data.insert(
+                    "system_color_emoji".to_owned(),
+                    egui::FontData::from_owned(bytes).into(),
+                );
+                system_emoji_key = Some("system_color_emoji".to_owned());
+                break;
+            }
+            Ok(_) => log::debug!("Skipping empty emoji font path {}", path.display()),
+            Err(e) => log::debug!("No emoji font at {}: {}", path.display(), e),
+        }
+    }
+
+    let mut system_cjk_keys: Vec<String> = Vec::new();
+    for path in system_cjk_font_paths() {
+        match std::fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => {
+                let key = format!("system_cjk_{}", system_cjk_keys.len());
+                log::info!("Loaded CJK fallback '{}' from {}", key, path.display());
+                fonts.font_data.insert(
+                    key.clone(),
+                    egui::FontData::from_owned(bytes).into(),
+                );
+                system_cjk_keys.push(key);
+                break;
+            }
+            Ok(_) => log::debug!("Skipping empty CJK font path {}", path.display()),
+            Err(e) => log::debug!("No CJK font at {}: {}", path.display(), e),
+        }
+    }
+
+    let mut proportional: Vec<String> = Vec::new();
+    let primary_ui = if fonts.font_data.contains_key("Manrope") {
+        "Manrope"
+    } else {
+        "Ubuntu-Light"
+    };
+    proportional.push(primary_ui.to_owned());
+    proportional.push("NotoEmoji-Regular".to_owned());
+    if let Some(ref k) = system_emoji_key {
+        proportional.push(k.clone());
+    }
+    proportional.extend(system_cjk_keys.iter().cloned());
+    if primary_ui == "Manrope" {
+        proportional.push("Ubuntu-Light".to_owned());
+    }
+    proportional.push("emoji-icon-font".to_owned());
+
+    let mut monospace: Vec<String> = Vec::new();
+    monospace.push("Hack".to_owned());
+    monospace.push("NotoEmoji-Regular".to_owned());
+    if let Some(ref k) = system_emoji_key {
+        monospace.push(k.clone());
+    }
+    monospace.extend(system_cjk_keys.iter().cloned());
+    monospace.push("Ubuntu-Light".to_owned());
+    monospace.push("emoji-icon-font".to_owned());
+
+    fonts.families.insert(egui::FontFamily::Proportional, proportional);
+    fonts.families.insert(egui::FontFamily::Monospace, monospace);
+
+    let mut emoji_only: Vec<String> = Vec::new();
+    if let Some(ref k) = system_emoji_key {
+        emoji_only.push(k.clone());
+    }
+    emoji_only.push("NotoEmoji-Regular".to_owned());
+    emoji_only.push("emoji-icon-font".to_owned());
+    fonts.families.insert(
+        egui::FontFamily::Name(EMOJI_FALLBACK_FAMILY.into()),
+        emoji_only,
+    );
+
+    ctx.set_fonts(fonts);
+}
+
+fn load_manrope_font_bytes() -> Option<Vec<u8>> {
     let manrope_font_files = ["Manrope.ttf", "Manrope-Regular.ttf", "Manrope-Medium.ttf"];
     let app_font_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("assets")
@@ -3433,8 +5364,8 @@ fn install_manrope_font(ctx: &egui::Context) {
         .collect();
     candidates.extend(manrope_font_files.iter().flat_map(|file| {
         [
-            format!("/Library/Fonts/{}", file),
-            format!("/System/Library/Fonts/{}", file),
+            format!("/Library/Fonts/{file}"),
+            format!("/System/Library/Fonts/{file}"),
         ]
     }));
     if let Some(home) = std::env::var_os("HOME") {
@@ -3457,24 +5388,79 @@ fn install_manrope_font(ctx: &egui::Context) {
         .map(|path| (*path).to_string()),
     );
 
-    let mut fonts = egui::FontDefinitions::default();
-    let Some((font_name, font_data)) = candidates
+    candidates
         .iter()
-        .find_map(|path| std::fs::read(path).ok().map(|bytes| (path.clone(), bytes)))
-    else {
-        return;
-    };
+        .find_map(|path| std::fs::read(path).ok().filter(|b| !b.is_empty()))
+}
 
-    fonts.font_data.insert(
-        font_name.clone(),
-        egui::FontData::from_owned(font_data).into(),
-    );
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, font_name);
-    ctx.set_fonts(fonts);
+fn system_emoji_font_paths() -> Vec<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![std::path::PathBuf::from(
+            "/System/Library/Fonts/Apple Color Emoji.ttc",
+        )]
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
+        vec![std::path::PathBuf::from(windir)
+            .join("Fonts")
+            .join("seguiemj.ttf")]
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        vec![
+            std::path::PathBuf::from("/usr/share/fonts/noto/NotoColorEmoji.ttf"),
+            std::path::PathBuf::from("/usr/share/fonts/opentype/noto/NotoColorEmoji.ttf"),
+            std::path::PathBuf::from("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"),
+        ]
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(unix, not(target_os = "macos"))
+    )))]
+    {
+        Vec::new()
+    }
+}
+
+fn system_cjk_font_paths() -> Vec<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![
+            std::path::PathBuf::from("/System/Library/Fonts/PingFang.ttc"),
+            std::path::PathBuf::from("/System/Library/Fonts/STHeiti Light.ttc"),
+            std::path::PathBuf::from("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+        ]
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let fonts = std::path::PathBuf::from(windir).join("Fonts");
+        vec![
+            fonts.join("msyh.ttc"),
+            fonts.join("YuGothM.ttc"),
+            fonts.join("msgothic.ttc"),
+        ]
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        vec![
+            std::path::PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+            std::path::PathBuf::from("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"),
+            std::path::PathBuf::from("/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc"),
+            std::path::PathBuf::from("/usr/share/fonts/noto/NotoSansCJK-Regular.ttc"),
+        ]
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(unix, not(target_os = "macos"))
+    )))]
+    {
+        Vec::new()
+    }
 }
 
 fn display_position_ms(state: &PlaybackState) -> u32 {

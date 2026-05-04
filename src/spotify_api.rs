@@ -2,9 +2,37 @@
 ///
 /// Thin wrappers around `rspotify` for fetching user playlists and
 /// their contents.
+///
+/// Token expiry: `AuthCodeSpotify` is configured with `token_refreshing: true`
+/// (see `auth::create_spotify_client`). `BaseClient::auth_headers` refreshes
+/// the access token via the refresh token when needed — callers do not need
+/// to wrap each call with manual expiry checks.
 use anyhow::{Context, Result, anyhow};
-use rspotify::{AuthCodeSpotify, prelude::*};
+use rspotify::{
+    AuthCodeSpotify,
+    clients::OAuthClient,
+    model::{FullTrack, Market, TrackId},
+    prelude::*,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Duration;
+
+/// Synthetic playlist id for the user's saved tracks (Spotify "Liked Songs").
+pub const ONYX_LIKED_SONGS_ID: &str = "onyx:liked-songs";
+
+/// Prefix for synthetic queue ids when playing from an artist's popular tracks.
+pub const ONYX_ARTIST_QUEUE_PREFIX: &str = "onyx:artist:";
+
+#[inline]
+pub fn artist_queue_playlist_id(artist_id: &str) -> String {
+    format!("{ONYX_ARTIST_QUEUE_PREFIX}{artist_id}")
+}
+
+#[inline]
+pub fn is_artist_queue_playlist(id: &str) -> bool {
+    id.starts_with(ONYX_ARTIST_QUEUE_PREFIX)
+}
 
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(30);
 const PLAYLIST_BATCH_DELAY: Duration = Duration::from_millis(150);
@@ -33,17 +61,58 @@ pub struct PlaylistSummary {
 }
 
 /// A track within a playlist.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaylistTrack {
     pub position: u32,
     pub name: String,
     pub artist: String,
+    /// Spotify artist id for the first credited artist (for navigation).
+    pub artist_id: Option<String>,
     pub album: String,
     pub album_image_url: Option<String>,
     pub album_thumbnail_url: Option<String>,
     pub added_at: Option<String>,
     pub duration_ms: u32,
     pub spotify_uri: String,
+}
+
+/// Artist header data for the artist page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtistProfile {
+    pub id: String,
+    pub name: String,
+    pub image_url: Option<String>,
+    pub thumbnail_url: Option<String>,
+    pub followers: u32,
+}
+
+/// One row in the discography section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtistAlbumSummary {
+    pub id: String,
+    pub name: String,
+    pub album_type_label: String,
+    pub release_year: String,
+    pub thumbnail_url: Option<String>,
+}
+
+/// Sidebar row for Liked Songs (not a real Spotify playlist id).
+pub fn liked_songs_summary(track_count: u32) -> PlaylistSummary {
+    PlaylistSummary {
+        id: ONYX_LIKED_SONGS_ID.to_string(),
+        name: "Liked Songs".to_string(),
+        track_count,
+        image_url: None,
+        thumbnail_url: None,
+        owner_name: Some("You".to_string()),
+        public_label: "Playlist".to_string(),
+        snapshot_id: None,
+    }
+}
+
+#[inline]
+pub fn is_liked_songs_playlist(id: &str) -> bool {
+    id == ONYX_LIKED_SONGS_ID
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -194,6 +263,15 @@ where
     Ok(tracks)
 }
 
+/// Total count of saved tracks (one lightweight `me/tracks` page request).
+pub async fn user_saved_tracks_total(spotify: &AuthCodeSpotify) -> Result<u32> {
+    let page = spotify
+        .current_user_saved_tracks_manual(None, Some(1), Some(0))
+        .await
+        .context("Failed to fetch saved tracks count")?;
+    Ok(page.total)
+}
+
 /// Fetch all of the authenticated user's saved tracks (Liked Songs).
 pub async fn user_saved_tracks(spotify: &AuthCodeSpotify) -> Result<Vec<PlaylistTrack>> {
     use futures_util::TryStreamExt;
@@ -206,18 +284,25 @@ pub async fn user_saved_tracks(spotify: &AuthCodeSpotify) -> Result<Vec<Playlist
 
     let tracks = items
         .into_iter()
-        .filter_map(|item| {
+        .enumerate()
+        .filter_map(|(position, item)| {
             let t = item.track;
             let artist = t
                 .artists
                 .first()
                 .map(|a| a.name.clone())
                 .unwrap_or_default();
+            let artist_id = t
+                .artists
+                .first()
+                .and_then(|a| a.id.as_ref())
+                .map(|id| id.to_string());
             let uri = t.id.as_ref()?.uri();
             Some(PlaylistTrack {
-                position: 0,
+                position: position as u32,
                 name: t.name,
                 artist,
+                artist_id,
                 album: t.album.name,
                 album_image_url: best_image_url(&t.album.images, 160),
                 album_thumbnail_url: best_image_url(&t.album.images, 36),
@@ -229,6 +314,246 @@ pub async fn user_saved_tracks(spotify: &AuthCodeSpotify) -> Result<Vec<Playlist
         .collect();
 
     Ok(tracks)
+}
+
+/// Map a full track to [`PlaylistTrack`] (e.g. artist top tracks).
+pub fn full_track_to_playlist_track(
+    t: rspotify::model::FullTrack,
+    position: u32,
+    primary_artist_id_override: Option<&str>,
+) -> Option<PlaylistTrack> {
+    let id = t.id.as_ref()?;
+    let artist = t
+        .artists
+        .first()
+        .map(|a| a.name.clone())
+        .unwrap_or_default();
+    let artist_id = primary_artist_id_override
+        .map(|s| s.to_string())
+        .or_else(|| {
+            t.artists
+                .first()
+                .and_then(|a| a.id.as_ref())
+                .map(|aid| aid.to_string())
+        });
+    Some(PlaylistTrack {
+        position,
+        name: t.name,
+        artist,
+        artist_id,
+        album: t.album.name,
+        album_image_url: best_image_url(&t.album.images, 160),
+        album_thumbnail_url: best_image_url(&t.album.images, 36),
+        added_at: None,
+        duration_ms: t.duration.num_milliseconds() as u32,
+        spotify_uri: id.uri(),
+    })
+}
+
+/// Fetch full tracks for Spotify track URIs in the same order as `uris` (sparse skips).
+pub async fn fetch_full_tracks_for_uris_ordered(
+    spotify: &AuthCodeSpotify,
+    uris: &[String],
+    market: Option<Market>,
+) -> Result<Vec<Option<FullTrack>>> {
+    let mut out: Vec<Option<FullTrack>> = vec![None; uris.len()];
+    let mut indexed: Vec<(usize, TrackId<'static>)> = Vec::new();
+    for (i, uri) in uris.iter().enumerate() {
+        if uri.is_empty() {
+            continue;
+        }
+        let tid = match TrackId::from_uri(uri.as_str()) {
+            Ok(t) => t.into_static(),
+            Err(_) => continue,
+        };
+        indexed.push((i, tid));
+    }
+
+    for chunk in indexed.chunks(50) {
+        let idxs: Vec<usize> = chunk.iter().map(|(i, _)| *i).collect();
+        let ids: Vec<TrackId<'static>> = chunk.iter().map(|(_, t)| t.clone()).collect();
+        #[allow(deprecated)]
+        let got = spotify
+            .tracks(ids.iter().map(|t| t.clone()), market)
+            .await;
+        match got {
+            Ok(tracks) => {
+                for (k, ft) in tracks.into_iter().enumerate() {
+                    if let Some(&ix) = idxs.get(k) {
+                        out[ix] = Some(ft);
+                    }
+                }
+            }
+            Err(e) => {
+                log::debug!("get several tracks failed ({e:#}); fetching individually");
+                for (k, tid) in ids.into_iter().enumerate() {
+                    let ix = idxs[k];
+                    match spotify.track(tid, market).await {
+                        Ok(ft) => out[ix] = Some(ft),
+                        Err(e2) => log::debug!("track {ix}: {e2:#}"),
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Last.fm [`crate::metadata::ResolvedTrack`] rows enriched with Spotify track metadata.
+pub async fn popular_tracks_from_resolved(
+    spotify: &AuthCodeSpotify,
+    resolved: Vec<crate::metadata::ResolvedTrack>,
+    primary_artist_id: &str,
+    market: Option<Market>,
+) -> Result<Vec<PlaylistTrack>> {
+    let uris: Vec<String> = resolved
+        .iter()
+        .map(|r| r.spotify_uri.clone().unwrap_or_default())
+        .collect();
+    let fetched = fetch_full_tracks_for_uris_ordered(spotify, &uris, market).await?;
+
+    let mut out = Vec::with_capacity(resolved.len());
+    for (i, res) in resolved.into_iter().enumerate() {
+        let pos = i as u32;
+        let row = if let Some(Some(ft)) = fetched.get(i) {
+            full_track_to_playlist_track(ft.clone(), pos, Some(primary_artist_id))
+        } else {
+            None
+        };
+        out.push(row.unwrap_or_else(|| PlaylistTrack {
+            position: pos,
+            name: res.track.clone(),
+            artist: res.artist.clone(),
+            artist_id: Some(primary_artist_id.to_string()),
+            album: String::new(),
+            album_image_url: None,
+            album_thumbnail_url: None,
+            added_at: None,
+            duration_ms: 0,
+            spotify_uri: res.spotify_uri.unwrap_or_default(),
+        }));
+    }
+    Ok(out)
+}
+
+/// Load artist profile (name, images, follower count).
+pub async fn fetch_artist_profile(
+    spotify: &AuthCodeSpotify,
+    artist_id: &str,
+) -> Result<ArtistProfile> {
+    use rspotify::model::ArtistId;
+
+    let id_str = artist_id.split(':').last().unwrap_or(artist_id);
+    let aid = ArtistId::from_id(id_str).context("Invalid artist ID")?;
+    #[allow(deprecated)]
+    let a = spotify
+        .artist(aid)
+        .await
+        .context("Failed to fetch artist")?;
+    #[allow(deprecated)]
+    let followers = a.followers.total;
+    Ok(ArtistProfile {
+        id: a.id.to_string(),
+        name: a.name,
+        image_url: best_image_url(&a.images, 320),
+        thumbnail_url: best_image_url(&a.images, 64),
+        followers,
+    })
+}
+
+/// `market` query for catalog endpoints (`/artists/{id}/top-tracks`, `/artists/{id}/albums`).
+/// `Market::FromToken` often fails for dev apps or when `country` is absent; prefer explicit ISO.
+pub async fn catalog_market(spotify: &AuthCodeSpotify) -> Market {
+    use rspotify::model::Country;
+
+    match spotify.current_user().await {
+        Ok(user) => {
+            #[allow(deprecated)]
+            if let Some(c) = user.country {
+                return Market::Country(c);
+            }
+        }
+        Err(e) => log::debug!("current_user for catalog market: {:#}", e),
+    }
+    Market::Country(Country::UnitedStates)
+}
+
+/// Top tracks for an artist (Spotify catalog; market from user token).
+pub async fn fetch_artist_top_tracks(
+    spotify: &AuthCodeSpotify,
+    artist_id: &str,
+    market: Market,
+) -> Result<Vec<PlaylistTrack>> {
+    use rspotify::model::ArtistId;
+
+    let id_str = artist_id.split(':').last().unwrap_or(artist_id);
+    let aid = ArtistId::from_id(id_str).context("Invalid artist ID")?;
+    // Spotify still serves this endpoint; rspotify deprecates after Web API churn.
+    #[allow(deprecated)]
+    let tracks = spotify
+        .artist_top_tracks(aid, Some(market))
+        .await
+        .context("Failed to fetch artist top tracks")?;
+    Ok(tracks
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, t)| full_track_to_playlist_track(t, i as u32, Some(id_str)))
+        .collect())
+}
+
+/// Albums, singles, compilations, and appearances — deduped by album id.
+pub async fn fetch_artist_albums(
+    spotify: &AuthCodeSpotify,
+    artist_id: &str,
+    market: Market,
+) -> Result<Vec<ArtistAlbumSummary>> {
+    use futures_util::TryStreamExt;
+    use rspotify::model::{AlbumType, ArtistId};
+
+    let id_str = artist_id.split(':').last().unwrap_or(artist_id);
+    let aid = ArtistId::from_id(id_str).context("Invalid artist ID")?;
+    let groups = [
+        AlbumType::Album,
+        AlbumType::Single,
+        AlbumType::Compilation,
+        AlbumType::AppearsOn,
+    ];
+    let stream = spotify.artist_albums(aid, groups, Some(market));
+    let items: Vec<rspotify::model::SimplifiedAlbum> = stream
+        .try_collect()
+        .await
+        .context("Failed to fetch artist albums")?;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for a in items {
+        let Some(album_id) = a.id.as_ref() else {
+            continue;
+        };
+        let key = album_id.to_string();
+        if !seen.insert(key) {
+            continue;
+        }
+        let release_year = a
+            .release_date
+            .as_deref()
+            .and_then(|d| d.get(0..4))
+            .unwrap_or("—")
+            .to_string();
+        let album_type_label = a
+            .album_type
+            .clone()
+            .unwrap_or_else(|| "album".to_string())
+            .replace('_', " ");
+        out.push(ArtistAlbumSummary {
+            id: album_id.to_string(),
+            name: a.name,
+            album_type_label,
+            release_year,
+            thumbnail_url: best_image_url(&a.images, 64),
+        });
+    }
+    Ok(out)
 }
 
 /// Create a new playlist for the current user.
@@ -301,12 +626,18 @@ fn playlist_item_to_track(
         .first()
         .map(|a| a.name.clone())
         .unwrap_or_default();
+    let artist_id = t
+        .artists
+        .first()
+        .and_then(|a| a.id.as_ref())
+        .map(|id| id.to_string());
     let id = t.id.as_ref()?;
 
     Some(PlaylistTrack {
         position,
         name: t.name,
         artist,
+        artist_id,
         album: t.album.name,
         album_image_url: best_image_url(&t.album.images, 160),
         album_thumbnail_url: best_image_url(&t.album.images, 36),
@@ -314,6 +645,14 @@ fn playlist_item_to_track(
         duration_ms: t.duration.num_milliseconds() as u32,
         spotify_uri: id.uri(),
     })
+}
+
+/// Large + thumbnail URLs from a full track's album art.
+pub fn full_track_artwork_urls(t: &rspotify::model::FullTrack) -> (Option<String>, Option<String>) {
+    (
+        best_image_url(&t.album.images, 160),
+        best_image_url(&t.album.images, 36),
+    )
 }
 
 fn best_image_url(images: &[rspotify::model::Image], target_size: u32) -> Option<String> {

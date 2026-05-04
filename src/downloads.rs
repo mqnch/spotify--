@@ -1,11 +1,10 @@
-use crate::player::AudioCmd;
+use crate::player::{AudioCmd, AudioHandle};
 use crate::playlist_cache::{PlaylistCache, PlaylistDownloadStatus};
 use crate::spotify_api::{PlaylistSummary, PlaylistTrack};
 use eframe::egui;
 use rspotify::AuthCodeSpotify;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
 pub const DOWNLOAD_DOWNLOADING: &str = "downloading";
@@ -18,7 +17,7 @@ pub type DownloadStatuses = Arc<Mutex<HashMap<String, PlaylistDownloadStatus>>>;
 pub fn spawn_playlist_download(
     rt: &tokio::runtime::Handle,
     spotify: AuthCodeSpotify,
-    audio_cmd_tx: UnboundedSender<AudioCmd>,
+    audio: AudioHandle,
     statuses: DownloadStatuses,
     playlist: PlaylistSummary,
     cached_tracks: Vec<PlaylistTrack>,
@@ -74,7 +73,7 @@ pub fn spawn_playlist_download(
 
         let total = tracks.len() as u32;
         for (index, track) in tracks.iter().enumerate() {
-            let _ = audio_cmd_tx.send(AudioCmd::Preload {
+            let _ = audio.send(AudioCmd::Preload {
                 uri: track.spotify_uri.clone(),
             });
             set_status(

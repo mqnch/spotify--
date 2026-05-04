@@ -4,13 +4,20 @@
 /// spins up a local HTTP server to catch the callback, exchanges
 /// the authorization code for access + refresh tokens, and returns
 /// an authenticated `AuthCodeSpotify` client.
+///
+/// User tokens are persisted in the OS keyring (see `spotify_token_store`).
+/// rspotify's `auth_headers` path already calls `auto_reauth` when
+/// `token_refreshing` is true, so Web API calls refresh the access token
+/// without wrapping each endpoint.
 
 use anyhow::{anyhow, Context, Result};
 use rspotify::{
+    clients::OAuthClient,
     prelude::*,
-    scopes, AuthCodeSpotify, Config, Credentials, OAuth,
+    scopes, AuthCodeSpotify, CallbackError, Config, Credentials, OAuth, Token, TokenCallback,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 use tiny_http::{Response, Server};
 use url::Url;
 
@@ -21,9 +28,16 @@ use crate::config::AppConfig;
 /// a loopback IP literal is required.
 const REDIRECT_URI: &str = "http://127.0.0.1:8888/callback";
 
-/// Run the full OAuth2 flow and return an authenticated Spotify client.
-pub async fn authenticate(config: &AppConfig) -> Result<AuthCodeSpotify> {
-    // ── 1. Build rspotify credentials & OAuth ────────────────────────
+fn persist_token_callback() -> TokenCallback {
+    TokenCallback(Box::new(|token: Token| {
+        crate::spotify_token_store::save_token(&token).map_err(|e| {
+            CallbackError::CustomizedError(format!("Failed to persist Spotify token: {e}"))
+        })
+    }))
+}
+
+/// Build an `AuthCodeSpotify` client with keyring-backed persistence (no disk cache file).
+pub fn create_spotify_client(config: &AppConfig) -> AuthCodeSpotify {
     let creds = Credentials::new(
         &config.spotify_client_id,
         &config.spotify_client_secret,
@@ -45,42 +59,86 @@ pub async fn authenticate(config: &AppConfig) -> Result<AuthCodeSpotify> {
     };
 
     let rspotify_config = Config {
-        token_cached: true,
-        cache_path: std::path::PathBuf::from(".spotify_token_cache.json"),
+        token_cached: false,
+        token_refreshing: true,
+        token_callback_fn: Arc::new(Some(persist_token_callback())),
         ..Default::default()
     };
 
-    let spotify = AuthCodeSpotify::with_config(creds, oauth, rspotify_config);
-    let cache_only = crate::spotify_api::cache_only_mode();
+    AuthCodeSpotify::with_config(creds, oauth, rspotify_config)
+}
 
-    // ── 2. Try to use a cached token first ───────────────────────────
-    // If a valid (or refreshable) token is on disk, skip the browser flow.
-    let token_from_cache = spotify.read_token_cache(false).await;
-    if let Ok(Some(token)) = token_from_cache {
-        // Place the cached token into the client.
-        *spotify.token.lock().await.unwrap() = Some(token);
+fn refresh_failed_hard(err: &rspotify::ClientError) -> bool {
+    matches!(err, rspotify::ClientError::InvalidToken)
+        || err.to_string().to_ascii_lowercase().contains("invalid_grant")
+}
 
-        if cache_only {
-            println!("✓ Spotify API disabled; using cached token without verification.");
-            return Ok(spotify);
+/// Load token from keyring (including one-time migration from the legacy JSON file),
+/// refresh if expired, and verify with the Web API.
+///
+/// On revoked / invalid refresh token, clears the keyring entry and returns `Ok(false)`.
+pub async fn try_restore_from_keyring(spotify: &AuthCodeSpotify) -> Result<bool> {
+    crate::spotify_token_store::migrate_legacy_file_if_needed()?;
+
+    let Some(token) = crate::spotify_token_store::load_token() else {
+        return Ok(false);
+    };
+
+    *spotify.token.lock().await.unwrap() = Some(token);
+
+    if spotify
+        .token
+        .lock()
+        .await
+        .unwrap()
+        .as_ref()
+        .is_some_and(|t| t.is_expired())
+    {
+        match spotify.refresh_token().await {
+            Ok(()) => {}
+            Err(e) => {
+                log::warn!("Spotify token refresh failed on restore: {}", e);
+                if refresh_failed_hard(&e) {
+                    let _ = crate::spotify_token_store::clear_token();
+                }
+                return Ok(false);
+            }
         }
-
-        // Attempt a lightweight API call to verify the token is still good.
-        if spotify.current_user().await.is_ok() {
-            println!("✓ Spotify authenticated (cached token).");
-            return Ok(spotify);
-        }
-        // Token was invalid/expired and couldn't refresh — fall through
-        // to the full browser flow.
     }
 
+    match spotify.current_user().await {
+        Ok(_) => Ok(true),
+        Err(e) => {
+            log::warn!("Spotify verify (current_user) failed: {}", e);
+            match spotify.refresh_token().await {
+                Ok(()) => match spotify.current_user().await {
+                    Ok(_) => Ok(true),
+                    Err(e2) => {
+                        log::warn!("Spotify verify after refresh failed: {}", e2);
+                        Ok(false)
+                    }
+                },
+                Err(re) => {
+                    log::warn!("Spotify refresh after failed verify: {}", re);
+                    if refresh_failed_hard(&re) {
+                        let _ = crate::spotify_token_store::clear_token();
+                    }
+                    Ok(false)
+                }
+            }
+        }
+    }
+}
+
+/// Browser OAuth only (used for first login and in-app reconnect). Persists via `token_callback_fn`.
+pub async fn authenticate_interactive(spotify: &AuthCodeSpotify) -> Result<()> {
+    let cache_only = crate::spotify_api::cache_only_mode();
     if cache_only {
         return Err(anyhow!(
-            "ONYX_CACHE_ONLY=1 requires an existing cached Spotify token"
+            "ONYX_CACHE_ONLY=1 does not allow interactive Spotify login"
         ));
     }
 
-    // ── 3. Generate the authorization URL ────────────────────────────
     let auth_url = spotify.get_authorize_url(false)?;
 
     println!();
@@ -89,28 +147,66 @@ pub async fn authenticate(config: &AppConfig) -> Result<AuthCodeSpotify> {
     println!("  {}", auth_url);
     println!();
 
-    // ── 4. Open the browser ──────────────────────────────────────────
     if let Err(e) = open::that(&auth_url) {
         eprintln!("  ⚠ Could not open browser automatically: {}", e);
     }
 
-    // ── 5. Spin up local server & wait for the callback ──────────────
     let code = receive_callback_code()?;
 
-    // ── 6. Exchange code for tokens ──────────────────────────────────
     spotify
         .request_token(&code)
         .await
         .context("Failed to exchange authorization code for tokens")?;
 
-    // Persist the token to disk for next launch.
-    spotify
-        .write_token_cache()
-        .await
-        .context("Failed to cache Spotify token")?;
-
     println!("✓ Spotify authenticated successfully.");
+    Ok(())
+}
+
+/// Full restore + interactive OAuth (CLI / headless). Prefer
+/// [`restore_spotify_session`] + GUI when launching the desktop app.
+#[allow(dead_code)]
+pub async fn authenticate(config: &AppConfig) -> Result<AuthCodeSpotify> {
+    let spotify = create_spotify_client(config);
+    let cache_only = crate::spotify_api::cache_only_mode();
+
+    if try_restore_from_keyring(&spotify).await? {
+        if cache_only {
+            println!("✓ Spotify API disabled; using keyring token without verification.");
+        } else {
+            println!("✓ Spotify authenticated (restored from keyring).");
+        }
+        return Ok(spotify);
+    }
+
+    if cache_only {
+        return Err(anyhow!(
+            "ONYX_CACHE_ONLY=1 requires a valid Spotify token in the keyring"
+        ));
+    }
+
+    authenticate_interactive(&spotify).await?;
     Ok(spotify)
+}
+
+/// Current Web API access token, if the client holds one.
+pub async fn access_token(spotify: &AuthCodeSpotify) -> Option<String> {
+    match spotify.token.lock().await {
+        Ok(guard) => guard.as_ref().map(|t| t.access_token.clone()),
+        Err(_) => {
+            log::warn!("Spotify token mutex could not be locked");
+            None
+        }
+    }
+}
+
+/// Restore only; returns `None` if the user must sign in again (no browser).
+pub async fn restore_spotify_session(config: &AppConfig) -> Result<Option<AuthCodeSpotify>> {
+    let spotify = create_spotify_client(config);
+    if try_restore_from_keyring(&spotify).await? {
+        Ok(Some(spotify))
+    } else {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------

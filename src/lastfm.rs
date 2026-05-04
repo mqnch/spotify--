@@ -1,8 +1,8 @@
 /// Last.fm REST API client.
 ///
-/// Provides async methods for `track.search`, `artist.getInfo`, and
-/// `artist.getTopTracks`.  Uses `reqwest` + `serde` for zero-cost JSON
-/// deserialization.
+/// Provides async methods for `track.search`, `artist.getInfo`,
+/// `artist.getTopTracks`, and `artist.getTopAlbums`. Uses `reqwest` + `serde`
+/// for JSON deserialization.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -128,6 +128,70 @@ impl LastFmClient {
 
         Ok(body.toptracks.track.unwrap_or_default())
     }
+
+    // ── artist.getTopAlbums ─────────────────────────────────────────
+
+    /// Top albums for an artist (Last.fm charts).
+    pub async fn artist_top_albums(&self, artist: &str, limit: u32) -> Result<Vec<TopAlbum>> {
+        let limit_str = limit.to_string();
+        let params = [
+            ("method", "artist.getTopAlbums"),
+            ("artist", artist),
+            ("api_key", &self.api_key),
+            ("format", "json"),
+            ("limit", &limit_str),
+            ("autocorrect", "1"),
+        ];
+
+        let resp = self
+            .http
+            .get(BASE_URL)
+            .query(&params)
+            .send()
+            .await
+            .context("Last.fm artist.getTopAlbums request failed")?;
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse artist.getTopAlbums response")?;
+
+        let album_val = body
+            .pointer("/topalbums/album")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        let mut albums: Vec<TopAlbum> = match album_val {
+            serde_json::Value::Array(arr) => arr
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect(),
+            serde_json::Value::Object(_) => serde_json::from_value(album_val)
+                .map(|a: TopAlbum| vec![a])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+
+        albums.truncate(limit as usize);
+        Ok(albums)
+    }
+}
+
+/// Pick the largest Last.fm image URL (by declared size).
+pub fn best_lastfm_image_url(images: &[LfImage]) -> Option<String> {
+    let rank = |s: &str| match s {
+        "mega" => 6,
+        "extralarge" => 5,
+        "large" => 4,
+        "medium" => 3,
+        "small" => 2,
+        _ => 1,
+    };
+    images
+        .iter()
+        .filter(|im| !im.url.is_empty())
+        .max_by_key(|im| rank(im.size.as_str()))
+        .map(|im| im.url.clone())
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -178,6 +242,16 @@ pub struct ArtistInfo {
     pub bio: Option<ArtistBio>,
     pub tags: Option<ArtistTags>,
     pub similar: Option<SimilarArtists>,
+}
+
+/// One-line audience string from Last.fm `stats.listeners` (when Spotify shows 0 followers).
+pub fn format_listener_line(info: &ArtistInfo) -> Option<String> {
+    let n = info
+        .stats
+        .as_ref()
+        .and_then(|s| s.listeners.as_ref())
+        .and_then(|l| l.replace(',', "").parse::<u64>().ok())?;
+    Some(format!("{n} listeners (Last.fm)"))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -239,4 +313,25 @@ pub struct TopTrack {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TopTrackArtist {
     pub name: String,
+}
+
+// -- artist.getTopAlbums --
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TopAlbum {
+    pub name: String,
+    #[serde(default)]
+    pub playcount: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub image: Option<Vec<LfImage>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LfImage {
+    #[serde(rename = "#text")]
+    pub url: String,
+    #[serde(default)]
+    pub size: String,
 }
